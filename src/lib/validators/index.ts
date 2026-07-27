@@ -22,7 +22,7 @@ import {
   USER_PLAYER_GENDERS,
   VOLLEYBALL_POSITIONS,
 } from "@/lib/constants/profile";
-import { PLAY_FORMATS } from "@/lib/labels/play-format";
+import { CREATABLE_PLAY_FORMATS } from "@/lib/labels/play-format";
 import { isCollegeEmail } from "@/lib/utils/college-email";
 
 export const signUpSchema = z.object({
@@ -117,8 +117,8 @@ export const createTournamentSchema = z.object({
   date: z.string().min(1, "Date is required"),
   location: z.string().min(1, "Location is required"),
   address: z.string().optional(),
-  playFormat: z.enum(PLAY_FORMATS, {
-    message: "Choose a tournament format",
+  playFormat: z.enum(CREATABLE_PLAY_FORMATS, {
+    message: "Choose pool-to-bracket or single elimination",
   }),
 });
 
@@ -131,6 +131,7 @@ export const updateScoreSchema = z.object({
   setNumber: z.number().int().positive(),
   teamAScore: z.number().int().min(0),
   teamBScore: z.number().int().min(0),
+  expectedRevision: z.number().int().min(0),
 });
 
 const updateMatchFormatBaseSchema = z.object({

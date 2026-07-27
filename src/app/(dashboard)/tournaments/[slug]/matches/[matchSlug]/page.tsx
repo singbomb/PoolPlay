@@ -211,6 +211,7 @@ export default async function MatchPage({ params }: Props) {
             : null,
           startedAt: match.startedAt ? match.startedAt.toISOString() : null,
           winnerId: match.winnerId,
+          scoreRevision: match.scoreRevision,
           teamA,
           teamB,
           refTeamName: refTeam?.name ?? null,

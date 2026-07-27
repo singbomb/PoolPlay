@@ -22,12 +22,10 @@ import { revalidatePath } from "next/cache";
 import { db } from "@/lib/db";
 import {
   matches,
-  pools,
-  sets,
   teamMembers,
   tournaments,
 } from "@/lib/db/schema";
-import { and, asc, eq, ne } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { requireUser } from "@/lib/auth";
 import { updateScoreSchema } from "@/lib/validators";
 import {
@@ -35,17 +33,18 @@ import {
   resolveIsTournamentOrganizer,
 } from "@/lib/tournaments/permissions";
 import { getMatchTournamentId } from "@/lib/tournaments/match-query";
-import { tryFillBracketFromPoolPlay, assignBracketRefsForBracket } from "@/lib/tournaments/bracket-structure";
-import { revertTournamentIfBracketsIncomplete } from "@/lib/tournaments/tournament-completion";
+import { assignBracketRefsForBracket } from "@/lib/tournaments/bracket-structure";
 import {
-  upsertSetScore,
-  completeMatchAndRunSideEffects,
+  finalizeMatchTransactional,
+  reopenMatchForCorrection,
+  saveSetScoreTransactional,
 } from "@/lib/tournaments/match-finalize";
+import { MAX_CORRECTION_REASON_LENGTH } from "@/lib/tournaments/match-correction";
 import {
-  evaluateMatchOutcome,
-  isSetComplete,
-  targetForSet,
-} from "@/lib/tournaments/match-format";
+  OperationConflictError,
+  OperationValidationError,
+} from "@/lib/tournaments/competition-operation-rules";
+import { transitionMatchLifecycleTransactional } from "@/lib/tournaments/score-operation-support";
 import { isTournamentArchived } from "@/lib/tournament-status";
 
 type MatchRow = typeof matches.$inferSelect;
@@ -57,6 +56,17 @@ interface ControlGate {
   tournament: TournamentRow | null;
   match: MatchRow | null;
   isOrganizer: boolean;
+}
+
+function competitionOperationError(error: unknown): string {
+  if (
+    error instanceof OperationConflictError ||
+    error instanceof OperationValidationError
+  ) {
+    return error.message;
+  }
+  console.error("Competition operation failed", error);
+  return "Could not save this match. Try again.";
 }
 
 async function loadUserTeamIds(userId: string): Promise<Set<string>> {
@@ -112,74 +122,48 @@ async function assertCanControlMatch(matchId: string): Promise<ControlGate> {
   return { error: null, user, tournament, match, isOrganizer };
 }
 
-export async function startWarmup(matchId: string) {
+async function changeMatchLifecycle(
+  matchId: string,
+  expectedRevision: number,
+  action: "warmup" | "start" | "pause"
+) {
   const gate = await assertCanControlMatch(matchId);
-  if (gate.error || !gate.match) return { error: gate.error };
-
-  if (gate.match.status !== "upcoming") {
-    return { error: "Warmup can only start before the match begins." };
+  if (gate.error || !gate.user) {
+    return { error: gate.error };
   }
 
-  await db
-    .update(matches)
-    .set({ warmupStartedAt: new Date(), updatedAt: new Date() })
-    .where(eq(matches.id, matchId));
-
-  revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
-  revalidatePath("/tournaments/[slug]", "page");
-  return { success: true as const };
+  try {
+    const result = await transitionMatchLifecycleTransactional({
+      matchId,
+      action,
+      expectedRevision,
+      actorUserId: gate.user.id,
+    });
+    revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
+    revalidatePath("/tournaments/[slug]", "page");
+    return { success: true as const, nextRevision: result.nextRevision };
+  } catch (error) {
+    return { error: competitionOperationError(error) };
+  }
 }
 
-export async function startMatch(matchId: string) {
-  const gate = await assertCanControlMatch(matchId);
-  if (gate.error || !gate.match) return { error: gate.error };
+export async function startWarmup(
+  matchId: string,
+  expectedRevision: number
+) {
+  return changeMatchLifecycle(matchId, expectedRevision, "warmup");
+}
 
-  if (gate.match.status === "completed") {
-    return { error: "This match is already completed." };
-  }
-
-  const now = new Date();
-  await db
-    .update(matches)
-    .set({
-      status: "in_progress",
-      startedAt: gate.match.startedAt ?? now,
-      warmupStartedAt: gate.match.warmupStartedAt ?? now,
-      updatedAt: now,
-    })
-    .where(eq(matches.id, matchId));
-
-  revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
-  revalidatePath("/tournaments/[slug]", "page");
-  return { success: true as const };
+export async function startMatch(matchId: string, expectedRevision: number) {
+  return changeMatchLifecycle(matchId, expectedRevision, "start");
 }
 
 /**
  * Take a live match out of in-progress. Scores and `startedAt` are kept so the
  * ref can resume later; status returns to `upcoming` and warmup is cleared.
  */
-export async function pauseMatch(matchId: string) {
-  const gate = await assertCanControlMatch(matchId);
-  if (gate.error || !gate.match) return { error: gate.error };
-
-  if (gate.match.status !== "in_progress") {
-    return { error: "Only an in-progress match can be paused." };
-  }
-
-  await db
-    .update(matches)
-    .set({
-      status: "upcoming",
-      warmupStartedAt: null,
-      // Preserve startedAt so the console treats this as paused, not fresh.
-      startedAt: gate.match.startedAt ?? new Date(),
-      updatedAt: new Date(),
-    })
-    .where(eq(matches.id, matchId));
-
-  revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
-  revalidatePath("/tournaments/[slug]", "page");
-  return { success: true as const };
+export async function pauseMatch(matchId: string, expectedRevision: number) {
+  return changeMatchLifecycle(matchId, expectedRevision, "pause");
 }
 
 /**
@@ -193,136 +177,115 @@ export async function saveSetScore(formData: FormData) {
     setNumber: parseInt(formData.get("setNumber") as string, 10),
     teamAScore: parseInt(formData.get("teamAScore") as string, 10),
     teamBScore: parseInt(formData.get("teamBScore") as string, 10),
+    expectedRevision: parseInt(
+      formData.get("expectedRevision") as string,
+      10
+    ),
   });
   if (!parsed.success) {
     return { error: parsed.error.issues[0].message };
   }
 
-  const { matchId, setNumber, teamAScore, teamBScore } = parsed.data;
+  const {
+    matchId,
+    setNumber,
+    teamAScore,
+    teamBScore,
+    expectedRevision,
+  } = parsed.data;
 
   const gate = await assertCanControlMatch(matchId);
-  if (gate.error || !gate.match || !gate.tournament) {
+  if (gate.error || !gate.match || !gate.user) {
     return { error: gate.error };
   }
 
-  await upsertSetScore(matchId, setNumber, teamAScore, teamBScore);
+  try {
+    const result = await saveSetScoreTransactional({
+      matchId,
+      setNumber,
+      teamAScore,
+      teamBScore,
+      expectedRevision,
+      actorUserId: gate.user.id,
+    });
 
-  // First score entry promotes an upcoming/warmup match to in progress.
-  if (gate.match.status !== "in_progress" && gate.match.status !== "completed") {
-    const now = new Date();
-    await db
-      .update(matches)
-      .set({
-        status: "in_progress",
-        startedAt: gate.match.startedAt ?? now,
-        warmupStartedAt: gate.match.warmupStartedAt ?? now,
-        updatedAt: now,
-      })
-      .where(
-        and(eq(matches.id, matchId), ne(matches.status, "completed"))
-      );
-  }
-
-  if (gate.match.teamAId && gate.match.teamBId) {
-    const allSets = await db
-      .select({ teamAScore: sets.teamAScore, teamBScore: sets.teamBScore })
-      .from(sets)
-      .where(eq(sets.matchId, matchId))
-      .orderBy(asc(sets.setNumber));
-
-    // Only fully-finished sets (target reached, win by two) count toward
-    // finalizing — running scores from the live scorekeeper must not trip an
-    // early finish.
-    const formatSettings = {
-      format: gate.tournament.matchFormat,
-      targetScore: gate.tournament.setTargetScore,
-      tiebreakTargetScore: gate.tournament.tiebreakTargetScore,
+    revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
+    revalidatePath("/tournaments/[slug]", "page");
+    return {
+      success: true as const,
+      nextRevision: result.nextRevision,
+      newlyCompleted: result.newlyCompleted,
     };
-    const completedSets = allSets.filter((s, i) =>
-      isSetComplete(s.teamAScore, s.teamBScore, targetForSet(formatSettings, i + 1))
-    );
-
-    const outcome = evaluateMatchOutcome(
-      { format: gate.tournament.matchFormat },
-      gate.match.teamAId,
-      gate.match.teamBId,
-      completedSets
-    );
-
-    if (outcome.shouldFinalize) {
-      const [poolRow] = gate.match.poolId
-        ? await db
-            .select({ divisionId: pools.divisionId })
-            .from(pools)
-            .where(eq(pools.id, gate.match.poolId))
-            .limit(1)
-        : [];
-
-      await completeMatchAndRunSideEffects({
-        matchId,
-        winnerId: outcome.winnerId,
-        tournamentId: gate.tournament.id,
-        divisionId: poolRow?.divisionId,
-      });
-    }
+  } catch (error) {
+    return { error: competitionOperationError(error) };
   }
-
-  revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
-  revalidatePath("/tournaments/[slug]", "page");
-  return { success: true as const };
 }
 
-export async function finalizeMatch(matchId: string, winnerId: string | null) {
+export async function finalizeMatch(
+  matchId: string,
+  winnerId: string | null,
+  expectedRevision: number
+) {
   const gate = await assertCanControlMatch(matchId);
-  if (gate.error || !gate.match) return { error: gate.error };
-
-  if (gate.match.status === "completed") {
-    return { success: true as const };
+  if (gate.error || !gate.match || !gate.user) {
+    return { error: gate.error };
   }
 
-  const [row] = await db
-    .select({ poolId: matches.poolId, divisionId: pools.divisionId })
-    .from(matches)
-    .leftJoin(pools, eq(matches.poolId, pools.id))
-    .where(eq(matches.id, matchId))
-    .limit(1);
+  try {
+    const result = await finalizeMatchTransactional({
+      matchId,
+      winnerId,
+      expectedRevision,
+      actorUserId: gate.user.id,
+    });
 
-  if (!gate.tournament) {
-    return { error: "Tournament not found" };
+    revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
+    revalidatePath("/tournaments/[slug]", "page");
+    return { success: true as const, nextRevision: result.nextRevision };
+  } catch (error) {
+    return { error: competitionOperationError(error) };
   }
-
-  await completeMatchAndRunSideEffects({
-    matchId,
-    winnerId,
-    tournamentId: gate.tournament.id,
-    divisionId: row?.divisionId,
-  });
-
-  revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
-  revalidatePath("/tournaments/[slug]", "page");
-  return { success: true as const };
 }
 
 /** Host-only: reopen a completed match for corrections. */
-export async function reopenMatch(matchId: string) {
+export async function reopenMatch(
+  matchId: string,
+  expectedRevision: number,
+  reason: string
+) {
   const gate = await assertCanControlMatch(matchId);
-  if (gate.error || !gate.match) return { error: gate.error };
+  if (gate.error || !gate.match || !gate.user) return { error: gate.error };
   if (!gate.isOrganizer) {
     return { error: "Only the host can reopen a completed match." };
   }
-
-  await db
-    .update(matches)
-    .set({ status: "in_progress", winnerId: null, updatedAt: new Date() })
-    .where(eq(matches.id, matchId));
-
-  if (gate.tournament) {
-    await revertTournamentIfBracketsIncomplete(gate.tournament.id);
+  const correctionReason = reason.trim();
+  if (!correctionReason) {
+    return { error: "Add a correction reason before reopening the match." };
+  }
+  if (correctionReason.length > MAX_CORRECTION_REASON_LENGTH) {
+    return {
+      error: `Correction reasons must be ${MAX_CORRECTION_REASON_LENGTH} characters or fewer.`,
+    };
   }
 
-  revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
-  revalidatePath("/tournaments/[slug]", "page");
-  return { success: true as const };
+  try {
+    const result = await reopenMatchForCorrection({
+      matchId,
+      expectedRevision,
+      actorUserId: gate.user.id,
+      reason: correctionReason,
+    });
+
+    revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
+    revalidatePath("/tournaments/[slug]", "page");
+    return {
+      success: true as const,
+      nextRevision: result.nextRevision,
+      invalidatedMatchCount: result.invalidatedMatchCount,
+    };
+  } catch (error) {
+    return { error: competitionOperationError(error) };
+  }
 }
 
 /** Host-only: edit a match's planned start time from the match/pool/bracket UI. */

@@ -16,13 +16,14 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
   brackets,
   divisions,
   matches,
   poolTeams,
+  pools,
   sets,
   teams,
   tournaments,
@@ -54,6 +55,10 @@ import {
   type BracketMatchForRefs,
 } from "@/lib/tournaments/bracket-refs";
 import { rankTeamsForCombinedBrackets } from "@/lib/tournaments/combined-bracket-standings";
+import {
+  DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE,
+  isCreatablePlayFormat,
+} from "@/lib/labels/play-format";
 
 type DbClient = typeof db;
 
@@ -159,11 +164,10 @@ export async function ensureDivisionBracketSkeleton(
   format: string,
   client: DbClient = db
 ): Promise<void> {
-  if (
-    format !== "pool_to_bracket" &&
-    format !== "single_elimination" &&
-    format !== "double_elimination"
-  ) {
+  if (!isCreatablePlayFormat(format)) {
+    if (format === "double_elimination") {
+      throw new Error(DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE);
+    }
     return;
   }
 
@@ -191,13 +195,9 @@ export async function ensureDivisionBracketSkeleton(
   }
   if (await divisionBracketsHaveTeams(divisionId, client)) return;
 
-  const bracketType =
-    format === "double_elimination"
-      ? "double_elimination"
-      : "single_elimination";
   await client.insert(brackets).values({
     divisionId,
-    bracketType,
+    bracketType: "single_elimination",
     seedCount: 0,
     name: null,
     tier: 0,
@@ -508,8 +508,6 @@ export async function advanceBracketWinner(
   const [nextMatch] = await client
     .select({
       id: matches.id,
-      teamAId: matches.teamAId,
-      teamBId: matches.teamBId,
     })
     .from(matches)
     .where(
@@ -523,14 +521,13 @@ export async function advanceBracketWinner(
 
   if (!nextMatch) return;
 
-  const teamAId =
-    feed.slot === "A" ? match.winnerId : nextMatch.teamAId;
-  const teamBId =
-    feed.slot === "B" ? match.winnerId : nextMatch.teamBId;
-
   await client
     .update(matches)
-    .set({ teamAId, teamBId, updatedAt: new Date() })
+    .set(
+      feed.slot === "A"
+        ? { teamAId: match.winnerId, updatedAt: new Date() }
+        : { teamBId: match.winnerId, updatedAt: new Date() }
+    )
     .where(eq(matches.id, nextMatch.id));
 
   await assignBracketRefsForBracket(match.bracketId, client);
@@ -1057,10 +1054,16 @@ export async function tournamentCombinedBracketsRegenerateState(
   }
 
   for (const div of poolDivisions) {
-    const poolId = await ensureDivisionAutoPool(div.id, client);
-    if (!poolId) {
+    const existingPools = await client
+      .select({ id: pools.id })
+      .from(pools)
+      .where(eq(pools.divisionId, div.id))
+      .orderBy(asc(pools.createdAt), asc(pools.id))
+      .limit(2);
+    if (existingPools.length !== 1) {
       return { canRegenerate: false, reason: "Pool setup is incomplete" };
     }
+    const poolId = existingPools[0].id;
     if (!(await isPoolPlayComplete(poolId, client))) {
       return {
         canRegenerate: false,
@@ -1112,9 +1115,9 @@ async function clearTournamentCombinedBracketTrees(
  * Re-seed gold / silver / bronze from current pool standings. Allowed only
  * before any real bracket match has been completed.
  */
-export async function regenerateTournamentCombinedBrackets(
+async function regenerateTournamentCombinedBracketsLocked(
   tournamentId: string,
-  client: DbClient = db
+  client: DbClient
 ): Promise<{ error?: string }> {
   const state = await tournamentCombinedBracketsRegenerateState(
     tournamentId,
@@ -1153,4 +1156,28 @@ export async function regenerateTournamentCombinedBrackets(
   await clearTournamentCombinedBracketTrees(tournamentId, client);
   await tryFillTournamentCombinedBrackets(tournamentId, client);
   return {};
+}
+
+export async function regenerateTournamentCombinedBracketsInTransaction(
+  tournamentId: string,
+  client: DbClient
+): Promise<{ error?: string }> {
+  await client.execute(sql`
+    SELECT id
+    FROM ${tournaments}
+    WHERE ${tournaments.id} = ${tournamentId}
+    FOR UPDATE
+  `);
+  return regenerateTournamentCombinedBracketsLocked(tournamentId, client);
+}
+
+export async function regenerateTournamentCombinedBrackets(
+  tournamentId: string
+): Promise<{ error?: string }> {
+  return db.transaction((tx) =>
+    regenerateTournamentCombinedBracketsInTransaction(
+      tournamentId,
+      tx as unknown as DbClient
+    )
+  );
 }

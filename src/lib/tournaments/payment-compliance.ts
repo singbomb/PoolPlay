@@ -21,6 +21,7 @@ import {
   registrationPayments,
   registrations,
   teams,
+  tournaments,
 } from "@/lib/db/schema";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type {
@@ -31,6 +32,10 @@ import {
   paymentSettingsFromTournament,
   type TournamentPaymentSettings,
 } from "@/lib/tournaments/payment-settings";
+import {
+  transitionRegistrationPaymentInTransaction,
+  type PaymentTransitionTransaction,
+} from "@/lib/tournaments/payment-transitions";
 
 const ACTIVE_REGISTRATION_STATUSES = [
   "pending",
@@ -48,13 +53,36 @@ export type RegistrationPaymentRow = {
   submittedAt: Date | null;
 };
 
+export type PaymentDbClient = typeof db | PaymentTransitionTransaction;
+
+type PaymentTournament = {
+  id: string;
+  paymentEnabled: boolean;
+  paymentRequiredBeforeConfirm: boolean;
+  paymentFirstTeamFeeCents: number | null;
+  paymentAdditionalTeamFeeCents: number | null;
+  paymentVenmoHandle: string | null;
+  paymentZelleHandle: string | null;
+  paymentCashappHandle: string | null;
+  paymentOtherInstructions: string | null;
+};
+
+type CreateRegistrationPaymentOptions = {
+  hostWaived?: boolean;
+  hostUserId?: string;
+  priorSchoolRegistrationCount?: number;
+  operationId?: string;
+  client?: PaymentTransitionTransaction;
+};
+
 export async function countSchoolRegistrationsForFee(
   tournamentId: string,
-  schoolId: string | null
+  schoolId: string | null,
+  client: PaymentDbClient = db
 ): Promise<number> {
   if (!schoolId) return 0;
 
-  const [row] = await db
+  const [row] = await client
     .select({ count: sql<number>`count(*)::int` })
     .from(registrations)
     .innerJoin(teams, eq(registrations.teamId, teams.id))
@@ -72,38 +100,67 @@ export async function countSchoolRegistrationsForFee(
 export async function computeRegistrationFeeCents(
   settings: TournamentPaymentSettings,
   tournamentId: string,
-  schoolId: string | null
+  schoolId: string | null,
+  options: {
+    priorSchoolRegistrationCount?: number;
+    client?: PaymentDbClient;
+  } = {}
 ): Promise<number | null> {
   if (!settings.enabled || settings.firstTeamFeeCents == null) return null;
 
   const additional =
     settings.additionalTeamFeeCents ?? settings.firstTeamFeeCents;
-  const priorCount = await countSchoolRegistrationsForFee(
-    tournamentId,
-    schoolId
-  );
+  const priorCount =
+    options.priorSchoolRegistrationCount ??
+    (await countSchoolRegistrationsForFee(
+      tournamentId,
+      schoolId,
+      options.client
+    ));
 
   return priorCount === 0 ? settings.firstTeamFeeCents : additional;
 }
 
 export async function createRegistrationPayment(
-  tournament: {
-    id: string;
-    paymentEnabled: boolean;
-    paymentRequiredBeforeConfirm: boolean;
-    paymentFirstTeamFeeCents: number | null;
-    paymentAdditionalTeamFeeCents: number | null;
-    paymentVenmoHandle: string | null;
-    paymentZelleHandle: string | null;
-    paymentCashappHandle: string | null;
-    paymentOtherInstructions: string | null;
-  },
+  tournament: PaymentTournament,
   registrationId: string,
   teamId: string,
   schoolId: string | null,
-  opts?: {
-    hostWaived?: boolean;
-    hostUserId?: string;
+  options: CreateRegistrationPaymentOptions = {}
+): Promise<void> {
+  const { client } = options;
+  if (client) {
+    await createRegistrationPaymentWithClient(
+      tournament,
+      registrationId,
+      teamId,
+      schoolId,
+      { ...options, client }
+    );
+    return;
+  }
+
+  await db.transaction((tx) =>
+    createRegistrationPaymentWithClient(
+      tournament,
+      registrationId,
+      teamId,
+      schoolId,
+      {
+        ...options,
+        client: tx,
+      }
+    )
+  );
+}
+
+async function createRegistrationPaymentWithClient(
+  tournament: PaymentTournament,
+  registrationId: string,
+  teamId: string,
+  schoolId: string | null,
+  options: CreateRegistrationPaymentOptions & {
+    client: PaymentTransitionTransaction;
   }
 ): Promise<void> {
   const settings = paymentSettingsFromTournament(tournament);
@@ -112,34 +169,81 @@ export async function createRegistrationPayment(
   const amountCents = await computeRegistrationFeeCents(
     settings,
     tournament.id,
-    schoolId
+    schoolId,
+    {
+      priorSchoolRegistrationCount: options.priorSchoolRegistrationCount,
+      client: options.client,
+    }
   );
   if (amountCents == null) return;
 
-  const now = new Date();
-  const waived = Boolean(opts?.hostWaived);
-
-  await db
+  await options.client
     .insert(registrationPayments)
     .values({
       registrationId,
       tournamentId: tournament.id,
       teamId,
       amountCents,
-      status: waived ? "waived" : "unpaid",
-      waivedByUserId: waived ? opts?.hostUserId ?? null : null,
-      waivedAt: waived ? now : null,
+      status: "unpaid",
     })
-    .onConflictDoNothing();
+    .onConflictDoNothing({ target: registrationPayments.registrationId });
+
+  if (options.hostWaived) {
+    await recordHostPaymentWaiver(registrationId, options);
+  }
 }
 
-export async function backfillRegistrationPayments(
-  tournament: Parameters<typeof createRegistrationPayment>[0]
+async function recordHostPaymentWaiver(
+  registrationId: string,
+  options: CreateRegistrationPaymentOptions & {
+    client: PaymentTransitionTransaction;
+  }
+): Promise<void> {
+  if (!options.hostUserId) {
+    throw new Error("A host user is required to waive a payment.");
+  }
+
+  const result = await transitionRegistrationPaymentInTransaction(
+    {
+      kind: "waive",
+      registrationId,
+      actorUserId: options.hostUserId,
+      operationId: crypto.randomUUID(),
+      auditMetadata: options.operationId
+        ? { batchOperationId: options.operationId }
+        : undefined,
+    },
+    options.client
+  );
+
+  if (
+    result.outcome === "applied" ||
+    result.outcome === "idempotent" ||
+    (result.outcome === "conflict" &&
+      (result.currentStatus === "confirmed" ||
+        result.currentStatus === "waived"))
+  ) {
+    return;
+  }
+
+  throw new Error("Could not record the host payment waiver.");
+}
+
+async function backfillRegistrationPaymentsWithClient(
+  tournament: PaymentTournament,
+  client: PaymentTransitionTransaction
 ): Promise<void> {
   const settings = paymentSettingsFromTournament(tournament);
   if (!settings.enabled || settings.firstTeamFeeCents == null) return;
 
-  const regRows = await db
+  await client.execute(sql`
+    SELECT id
+    FROM ${tournaments}
+    WHERE ${tournaments.id} = ${tournament.id}
+    FOR UPDATE
+  `);
+
+  const regRows = await client
     .select({
       id: registrations.id,
       teamId: registrations.teamId,
@@ -156,37 +260,65 @@ export async function backfillRegistrationPayments(
     )
     .orderBy(asc(registrations.registeredAt), asc(registrations.id));
 
-  const existingRows = await db
+  const existingRows = await client
     .select({ registrationId: registrationPayments.registrationId })
     .from(registrationPayments)
     .where(eq(registrationPayments.tournamentId, tournament.id));
 
-  const existingIds = new Set(existingRows.map((r) => r.registrationId));
+  await insertMissingRegistrationPayments(
+    tournament.id,
+    settings.firstTeamFeeCents,
+    settings.additionalTeamFeeCents ?? settings.firstTeamFeeCents,
+    regRows,
+    new Set(existingRows.map((row) => row.registrationId)),
+    client
+  );
+}
+
+async function insertMissingRegistrationPayments(
+  tournamentId: string,
+  firstTeamFeeCents: number,
+  additionalTeamFeeCents: number,
+  rows: Array<{ id: string; teamId: string; schoolId: string | null }>,
+  existingIds: Set<string>,
+  client: PaymentTransitionTransaction
+): Promise<void> {
   const schoolCounts = new Map<string, number>();
-  const additional =
-    settings.additionalTeamFeeCents ?? settings.firstTeamFeeCents;
 
-  for (const reg of regRows) {
-    if (existingIds.has(reg.id)) continue;
+  for (const row of rows) {
+    const prior = row.schoolId ? schoolCounts.get(row.schoolId) ?? 0 : 0;
+    const amountCents =
+      !row.schoolId || prior === 0
+        ? firstTeamFeeCents
+        : additionalTeamFeeCents;
+    if (row.schoolId) schoolCounts.set(row.schoolId, prior + 1);
+    if (existingIds.has(row.id)) continue;
 
-    let amountCents: number;
-    if (!reg.schoolId) {
-      amountCents = settings.firstTeamFeeCents;
-    } else {
-      const prior = schoolCounts.get(reg.schoolId) ?? 0;
-      amountCents =
-        prior === 0 ? settings.firstTeamFeeCents : additional;
-      schoolCounts.set(reg.schoolId, prior + 1);
-    }
-
-    await db.insert(registrationPayments).values({
-      registrationId: reg.id,
-      tournamentId: tournament.id,
-      teamId: reg.teamId,
-      amountCents,
-      status: "unpaid",
-    });
+    await client
+      .insert(registrationPayments)
+      .values({
+        registrationId: row.id,
+        tournamentId,
+        teamId: row.teamId,
+        amountCents,
+        status: "unpaid",
+      })
+      .onConflictDoNothing({ target: registrationPayments.registrationId });
   }
+}
+
+export async function backfillRegistrationPayments(
+  tournament: PaymentTournament,
+  client?: PaymentTransitionTransaction
+): Promise<void> {
+  if (client) {
+    await backfillRegistrationPaymentsWithClient(tournament, client);
+    return;
+  }
+
+  await db.transaction((tx) =>
+    backfillRegistrationPaymentsWithClient(tournament, tx)
+  );
 }
 
 export async function getPaymentsByRegistrationIds(
@@ -228,7 +360,7 @@ export function paymentBlocksConfirm(
   payment: Pick<RegistrationPaymentRow, "status"> | null | undefined
 ): boolean {
   if (!settings.enabled || !settings.requiredBeforeConfirm) return false;
-  if (!payment) return false;
+  if (!payment) return true;
   return payment.status !== "confirmed" && payment.status !== "waived";
 }
 

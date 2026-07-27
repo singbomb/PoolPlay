@@ -153,6 +153,7 @@ export function RegistrationList({
   const [bulkError, setBulkError] = useState<string | null>(null);
   const [errorMap, setErrorMap] = useState<Record<string, string>>({});
   const safetyRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingStatusOperations = useRef(new Map<string, string>());
 
   const showBulkSelect =
     listKind === "teams" && canManageRegistrations && !applicantView;
@@ -315,23 +316,41 @@ export function RegistrationList({
     ) => {
       setPending({ regId, expectedDivisionId: null, expectedStatus: status });
       if (safetyRef.current) clearTimeout(safetyRef.current);
+      const payloadKey = JSON.stringify({
+        tournamentId,
+        registrationIds: [regId],
+        toStatus: status,
+      });
+      const operationId =
+        pendingStatusOperations.current.get(payloadKey) ?? crypto.randomUUID();
+      pendingStatusOperations.current.set(payloadKey, operationId);
       try {
-        const result = await updateRegistrationStatus(regId, status);
+        const result = await updateRegistrationStatus(
+          regId,
+          status,
+          operationId
+        );
         if (result?.error) {
           setErrorMap((m) => ({ ...m, [regId]: result.error! }));
           setPending(null);
           return;
         }
+        pendingStatusOperations.current.delete(payloadKey);
         await router.refresh();
         safetyRef.current = setTimeout(() => {
           safetyRef.current = null;
           setPending((cur) => (cur?.regId === regId ? null : cur));
         }, 8_000);
       } catch {
+        setErrorMap((m) => ({
+          ...m,
+          [regId]:
+            "The status update could not be confirmed. Try again to safely retry it.",
+        }));
         setPending(null);
       }
     },
-    [router]
+    [router, tournamentId]
   );
 
   const handleConfirmAll = useCallback(
@@ -342,25 +361,40 @@ export function RegistrationList({
       });
       if (pendingIds.length === 0) return;
 
+      const operationRegistrationIds = [...pendingIds].sort();
+      const payloadKey = JSON.stringify({
+        tournamentId,
+        registrationIds: operationRegistrationIds,
+        toStatus: "confirmed",
+      });
+      const operationId =
+        pendingStatusOperations.current.get(payloadKey) ?? crypto.randomUUID();
+      pendingStatusOperations.current.set(payloadKey, operationId);
+
       setBulkError(null);
-      setBulkPendingIds(pendingIds);
+      setBulkPendingIds(operationRegistrationIds);
       if (safetyRef.current) clearTimeout(safetyRef.current);
       try {
         const result = await confirmPendingRegistrations(
           tournamentId,
-          pendingIds
+          operationRegistrationIds,
+          operationId
         );
         if (result?.error) {
           setBulkError(result.error);
           setBulkPendingIds(null);
           return;
         }
+        pendingStatusOperations.current.delete(payloadKey);
         await router.refresh();
         safetyRef.current = setTimeout(() => {
           safetyRef.current = null;
           setBulkPendingIds(null);
         }, 8_000);
       } catch {
+        setBulkError(
+          "The confirmation could not be verified. Try again to safely retry it."
+        );
         setBulkPendingIds(null);
       }
     },

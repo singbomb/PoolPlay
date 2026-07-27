@@ -22,10 +22,13 @@ BEGIN
       ('court_divisions'),
       ('courts'),
       ('divisions'),
+      ('match_score_events'),
       ('matches'),
       ('pool_teams'),
       ('pools'),
       ('registration_payments'),
+      ('registration_payment_events'),
+      ('registration_status_events'),
       ('registrations'),
       ('school_members'),
       ('schools'),
@@ -199,6 +202,11 @@ BEGIN
     VALUES
       ('auth_rate_limits_expiry_idx'),
       ('matches_tournament_slug_unique'),
+      ('matches_bracket_coordinate_unique'),
+      ('match_score_events_match_revision_unique'),
+      ('pool_teams_pool_team_unique'),
+      ('registration_payment_events_operation_unique'),
+      ('registration_status_events_team_operation_unique'),
       ('registrations_team_tournament_unique'),
       ('school_members_one_president_per_school'),
       ('school_members_school_user_unique'),
@@ -219,6 +227,18 @@ BEGIN
   FROM (
     VALUES
       ('divisions', 'divisions_bracket_count_check'),
+      ('match_score_events', 'match_score_events_event_type_check'),
+      ('match_score_events', 'match_score_events_revision_positive'),
+      ('matches', 'matches_score_revision_nonnegative'),
+      (
+        'registration_payments',
+        'registration_payments_amount_nonnegative'
+      ),
+      (
+        'registration_payments',
+        'registration_payments_terminal_metadata_consistent'
+      ),
+      ('registrations', 'registrations_revision_nonnegative'),
       ('tournaments', 'tournaments_bracket_count_check')
   ) AS expected(table_name, constraint_name)
   WHERE NOT EXISTS (

@@ -24,28 +24,42 @@ import { z } from "zod";
 import { requireUser } from "@/lib/auth";
 import { db } from "@/lib/db";
 import {
-  registrationPayments,
   registrations,
   teamMembers,
   tournaments,
 } from "@/lib/db/schema";
+import { backfillRegistrationPayments } from "@/lib/tournaments/payment-compliance";
 import {
-  backfillRegistrationPayments,
-  getPaymentsByRegistrationIds,
-} from "@/lib/tournaments/payment-compliance";
-import { paymentSettingsFromTournament } from "@/lib/tournaments/payment-access";
+  actorCanManagePaymentTournament,
+  transitionRegistrationPayment,
+  type RegistrationPaymentTransitionInput,
+  type RegistrationPaymentTransitionResult,
+} from "@/lib/tournaments/payment-transitions";
+import { OperationValidationError } from "@/lib/tournaments/competition-operation-rules";
+import { isTournamentArchived } from "@/lib/tournament-status";
 import {
   canEditTournamentSetup,
   resolveIsTournamentOrganizer,
   tournamentPreparationLockedReason,
 } from "@/lib/tournaments/permissions";
+import {
+  MAX_PAYMENT_FEE_INPUT_LENGTH,
+  parsePaymentFeeCents,
+  resolveTournamentPaymentFeeCents,
+} from "@/lib/tournaments/payment-fees";
 
 const paymentSettingsSchema = z
   .object({
     enabled: z.boolean(),
     requiredBeforeConfirm: z.boolean(),
-    firstTeamFeeDollars: z.string().trim(),
-    additionalTeamFeeDollars: z.string().trim(),
+    firstTeamFeeDollars: z
+      .string()
+      .trim()
+      .max(MAX_PAYMENT_FEE_INPUT_LENGTH, "Fee amount is too long."),
+    additionalTeamFeeDollars: z
+      .string()
+      .trim()
+      .max(MAX_PAYMENT_FEE_INPUT_LENGTH, "Fee amount is too long."),
     venmoHandle: z.string().trim().max(200),
     zelleHandle: z.string().trim().max(200),
     cashappHandle: z.string().trim().max(200),
@@ -54,7 +68,7 @@ const paymentSettingsSchema = z
   .superRefine((value, ctx) => {
     if (!value.enabled) return;
 
-    const first = parseDollarInput(value.firstTeamFeeDollars);
+    const first = parsePaymentFeeCents(value.firstTeamFeeDollars);
     if (first == null || first <= 0) {
       ctx.addIssue({
         code: "custom",
@@ -64,7 +78,9 @@ const paymentSettingsSchema = z
     }
 
     if (value.additionalTeamFeeDollars) {
-      const additional = parseDollarInput(value.additionalTeamFeeDollars);
+      const additional = parsePaymentFeeCents(
+        value.additionalTeamFeeDollars
+      );
       if (additional == null || additional < 0) {
         ctx.addIssue({
           code: "custom",
@@ -92,6 +108,7 @@ const paymentSettingsSchema = z
 
 const submitPaymentSchema = z.object({
   registrationId: z.string().uuid(),
+  operationId: z.string().uuid(),
   method: z.enum([
     "venmo",
     "zelle",
@@ -103,20 +120,43 @@ const submitPaymentSchema = z.object({
   note: z.string().trim().max(500),
 });
 
-function parseDollarInput(value: string): number | null {
-  const cleaned = value.replace(/[$,\s]/g, "");
-  if (!cleaned) return null;
-  const parsed = Number(cleaned);
-  if (!Number.isFinite(parsed)) return null;
-  return parsed;
+const hostPaymentSchema = z.object({
+  registrationId: z.string().uuid(),
+  operationId: z.string().uuid(),
+});
+
+function paymentTransitionError(
+  result: RegistrationPaymentTransitionResult,
+  kind: RegistrationPaymentTransitionInput["kind"]
+): string | null {
+  if (result.outcome === "applied" || result.outcome === "idempotent") {
+    return null;
+  }
+  if (result.outcome === "not_found") {
+    return "No payment record for this registration.";
+  }
+  if (result.outcome === "operation_conflict") {
+    return "This payment operation was already used for another change.";
+  }
+  if (result.outcome === "not_enabled") {
+    return "Payment tracking is not enabled for this tournament.";
+  }
+  if (result.outcome === "forbidden") {
+    return kind === "submit"
+      ? "Only the current team captain can submit payment."
+      : "Only the current tournament organizer can settle payments.";
+  }
+  if (kind === "submit") {
+    return "Payment has already been submitted or settled.";
+  }
+  return "Payment is already settled or changed. Refresh and try again.";
 }
 
-function dollarsToCents(dollars: number): number {
-  return Math.round(dollars * 100);
-}
-
-async function loadOrganizerTournament(tournamentId: string) {
-  const user = await requireUser();
+async function loadOrganizerTournament(
+  tournamentId: string,
+  authenticatedUser?: Awaited<ReturnType<typeof requireUser>>
+) {
+  const user = authenticatedUser ?? (await requireUser());
   const [tournament] = await db
     .select()
     .from(tournaments)
@@ -187,44 +227,70 @@ export async function updateTournamentPaymentSettings(
     };
   }
 
-  const firstTeamFeeCents = parsed.data.enabled
-    ? dollarsToCents(parseDollarInput(parsed.data.firstTeamFeeDollars)!)
-    : null;
+  const feeCents = resolveTournamentPaymentFeeCents(
+    parsed.data.enabled,
+    parsed.data.firstTeamFeeDollars,
+    parsed.data.additionalTeamFeeDollars
+  )!;
 
-  const additionalParsed = parsed.data.additionalTeamFeeDollars
-    ? parseDollarInput(parsed.data.additionalTeamFeeDollars)
-    : null;
-  const additionalTeamFeeCents =
-    parsed.data.enabled && additionalParsed != null
-      ? dollarsToCents(additionalParsed)
-      : parsed.data.enabled
-        ? firstTeamFeeCents
-        : null;
+  let updated: typeof tournaments.$inferSelect | undefined;
+  try {
+    updated = await db.transaction(async (tx) => {
+      const [lockedTournament] = await tx
+        .select()
+        .from(tournaments)
+        .where(eq(tournaments.id, tournamentId))
+        .for("update")
+        .limit(1);
+      if (!lockedTournament) return undefined;
+      if (
+        !(await actorCanManagePaymentTournament(
+          tx,
+          lockedTournament,
+          user.id
+        ))
+      ) {
+        throw new OperationValidationError(
+          "Only the current organizer can manage tournament payments."
+        );
+      }
+      if (isTournamentArchived(lockedTournament.date)) {
+        throw new OperationValidationError(
+          "Archived tournament payment settings cannot be changed."
+        );
+      }
 
-  await db
-    .update(tournaments)
-    .set({
-      paymentEnabled: parsed.data.enabled,
-      paymentRequiredBeforeConfirm: parsed.data.requiredBeforeConfirm,
-      paymentFirstTeamFeeCents: firstTeamFeeCents,
-      paymentAdditionalTeamFeeCents: additionalTeamFeeCents,
-      paymentVenmoHandle: parsed.data.venmoHandle || null,
-      paymentZelleHandle: parsed.data.zelleHandle || null,
-      paymentCashappHandle: parsed.data.cashappHandle || null,
-      paymentOtherInstructions: parsed.data.otherInstructions || null,
-      updatedAt: new Date(),
-    })
-    .where(eq(tournaments.id, tournamentId));
+      const [row] = await tx
+        .update(tournaments)
+        .set({
+          paymentEnabled: parsed.data.enabled,
+          paymentRequiredBeforeConfirm: parsed.data.requiredBeforeConfirm,
+          paymentFirstTeamFeeCents: feeCents.firstTeamFeeCents,
+          paymentAdditionalTeamFeeCents: feeCents.additionalTeamFeeCents,
+          paymentVenmoHandle: parsed.data.venmoHandle || null,
+          paymentZelleHandle: parsed.data.zelleHandle || null,
+          paymentCashappHandle: parsed.data.cashappHandle || null,
+          paymentOtherInstructions: parsed.data.otherInstructions || null,
+          updatedAt: new Date(),
+        })
+        .where(eq(tournaments.id, tournamentId))
+        .returning();
 
-  if (parsed.data.enabled) {
-    const [updated] = await db
-      .select()
-      .from(tournaments)
-      .where(eq(tournaments.id, tournamentId))
-      .limit(1);
-    if (updated) {
-      await backfillRegistrationPayments(updated);
+      if (parsed.data.enabled && row) {
+        await backfillRegistrationPayments(row, tx);
+      }
+      return row;
+    });
+  } catch (error) {
+    if (error instanceof OperationValidationError) {
+      return { error: error.message };
     }
+    console.error("Payment settings update failed", error);
+    return { error: "Could not update payment settings. Try again." };
+  }
+
+  if (!updated) {
+    return { error: "Tournament no longer exists." };
   }
 
   revalidatePath("/tournaments/[slug]", "page");
@@ -259,35 +325,28 @@ export async function captainSubmitPayment(
     return { error: "Payment tracking is not enabled for this tournament." };
   }
 
-  const payments = await getPaymentsByRegistrationIds([parsed.data.registrationId]);
-  const payment = payments.get(parsed.data.registrationId);
-  if (!payment) {
-    return { error: "No payment record for this registration." };
-  }
-
-  if (payment.status !== "unpaid") {
-    return { error: "Payment has already been submitted or settled." };
-  }
-
-  const now = new Date();
-  await db
-    .update(registrationPayments)
-    .set({
-      status: "submitted",
-      submittedMethod: parsed.data.method,
-      submittedNote: parsed.data.note || null,
-      submittedByUserId: user.id,
-      submittedAt: now,
-      updatedAt: now,
-    })
-    .where(eq(registrationPayments.registrationId, parsed.data.registrationId));
+  const transition = await transitionRegistrationPayment({
+    kind: "submit",
+    registrationId: parsed.data.registrationId,
+    actorUserId: user.id,
+    operationId: parsed.data.operationId,
+    method: parsed.data.method,
+    note: parsed.data.note || null,
+  });
+  const transitionError = paymentTransitionError(transition, "submit");
+  if (transitionError) return { error: transitionError };
 
   revalidatePath("/tournaments/[slug]", "page");
   return { success: true as const };
 }
 
-export async function hostConfirmPayment(registrationId: string) {
+export async function hostConfirmPayment(
+  registrationId: string,
+  operationId: string
+) {
   const user = await requireUser();
+  const parsed = hostPaymentSchema.safeParse({ registrationId, operationId });
+  if (!parsed.success) return { error: "Invalid payment operation." };
 
   const [reg] = await db
     .select({
@@ -295,41 +354,34 @@ export async function hostConfirmPayment(registrationId: string) {
       tournamentId: registrations.tournamentId,
     })
     .from(registrations)
-    .where(eq(registrations.id, registrationId))
+    .where(eq(registrations.id, parsed.data.registrationId))
     .limit(1);
 
   if (!reg) return { error: "Registration not found." };
 
-  const loaded = await loadOrganizerTournament(reg.tournamentId);
+  const loaded = await loadOrganizerTournament(reg.tournamentId, user);
   if ("error" in loaded) return loaded;
 
-  const payments = await getPaymentsByRegistrationIds([registrationId]);
-  const payment = payments.get(registrationId);
-  if (!payment) {
-    return { error: "No payment record for this registration." };
-  }
-
-  if (payment.status !== "submitted" && payment.status !== "unpaid") {
-    return { error: "Payment is already settled." };
-  }
-
-  const now = new Date();
-  await db
-    .update(registrationPayments)
-    .set({
-      status: "confirmed",
-      confirmedByUserId: user.id,
-      confirmedAt: now,
-      updatedAt: now,
-    })
-    .where(eq(registrationPayments.registrationId, registrationId));
+  const transition = await transitionRegistrationPayment({
+    kind: "confirm",
+    registrationId: parsed.data.registrationId,
+    actorUserId: user.id,
+    operationId: parsed.data.operationId,
+  });
+  const transitionError = paymentTransitionError(transition, "confirm");
+  if (transitionError) return { error: transitionError };
 
   revalidatePath("/tournaments/[slug]", "page");
   return { success: true as const };
 }
 
-export async function hostWaivePayment(registrationId: string) {
+export async function hostWaivePayment(
+  registrationId: string,
+  operationId: string
+) {
   const user = await requireUser();
+  const parsed = hostPaymentSchema.safeParse({ registrationId, operationId });
+  if (!parsed.success) return { error: "Invalid payment operation." };
 
   const [reg] = await db
     .select({
@@ -337,34 +389,22 @@ export async function hostWaivePayment(registrationId: string) {
       tournamentId: registrations.tournamentId,
     })
     .from(registrations)
-    .where(eq(registrations.id, registrationId))
+    .where(eq(registrations.id, parsed.data.registrationId))
     .limit(1);
 
   if (!reg) return { error: "Registration not found." };
 
-  const loaded = await loadOrganizerTournament(reg.tournamentId);
+  const loaded = await loadOrganizerTournament(reg.tournamentId, user);
   if ("error" in loaded) return loaded;
 
-  const payments = await getPaymentsByRegistrationIds([registrationId]);
-  const payment = payments.get(registrationId);
-  if (!payment) {
-    return { error: "No payment record for this registration." };
-  }
-
-  if (payment.status === "confirmed" || payment.status === "waived") {
-    return { error: "Payment is already settled." };
-  }
-
-  const now = new Date();
-  await db
-    .update(registrationPayments)
-    .set({
-      status: "waived",
-      waivedByUserId: user.id,
-      waivedAt: now,
-      updatedAt: now,
-    })
-    .where(eq(registrationPayments.registrationId, registrationId));
+  const transition = await transitionRegistrationPayment({
+    kind: "waive",
+    registrationId: parsed.data.registrationId,
+    actorUserId: user.id,
+    operationId: parsed.data.operationId,
+  });
+  const transitionError = paymentTransitionError(transition, "waive");
+  if (transitionError) return { error: transitionError };
 
   revalidatePath("/tournaments/[slug]", "page");
   return { success: true as const };

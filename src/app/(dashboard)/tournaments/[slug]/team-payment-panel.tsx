@@ -18,7 +18,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useState, startTransition } from "react";
+import { useRef, useState, startTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Check, DollarSign } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -82,12 +82,19 @@ export function TeamPaymentPanel({
   isOrganizer: boolean;
 }) {
   const router = useRouter();
-  const [busyId, setBusyId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [busyCountByRegistration, setBusyCountByRegistration] = useState<
+    Record<string, number>
+  >({});
+  const [errorByRegistration, setErrorByRegistration] = useState<
+    Record<string, string>
+  >({});
   const [method, setMethod] = useState<Record<string, RegistrationPaymentMethod>>(
     {}
   );
   const [note, setNote] = useState<Record<string, string>>({});
+  const pendingOperations = useRef(
+    new Map<string, { payloadKey: string; operationId: string }>()
+  );
 
   const instructions = paymentInstructionsText(settings);
 
@@ -95,18 +102,54 @@ export function TeamPaymentPanel({
 
   async function runAction(
     registrationId: string,
-    action: () => Promise<{ error?: string; success?: boolean }>
+    intentKey: string,
+    payloadKey: string,
+    action: (
+      operationId: string
+    ) => Promise<{ error?: string; success?: boolean }>
   ) {
-    setBusyId(registrationId);
-    setError(null);
-    const result = await action();
-    if (result?.error) {
-      setError(result.error);
-      setBusyId(null);
-      return;
+    const pending = pendingOperations.current.get(intentKey);
+    const operationId =
+      pending?.payloadKey === payloadKey
+        ? pending.operationId
+        : crypto.randomUUID();
+    pendingOperations.current.set(intentKey, { payloadKey, operationId });
+
+    setBusyCountByRegistration((current) => ({
+      ...current,
+      [registrationId]: (current[registrationId] ?? 0) + 1,
+    }));
+    setErrorByRegistration((current) => {
+      const next = { ...current };
+      delete next[registrationId];
+      return next;
+    });
+    try {
+      const result = await action(operationId);
+      if (result?.error) {
+        setErrorByRegistration((current) => ({
+          ...current,
+          [registrationId]: result.error!,
+        }));
+        return;
+      }
+      pendingOperations.current.delete(intentKey);
+      startTransition(() => router.refresh());
+    } catch {
+      setErrorByRegistration((current) => ({
+        ...current,
+        [registrationId]:
+          "The payment update could not be confirmed. Try again to safely retry it.",
+      }));
+    } finally {
+      setBusyCountByRegistration((current) => {
+        const next = { ...current };
+        const remaining = (next[registrationId] ?? 1) - 1;
+        if (remaining > 0) next[registrationId] = remaining;
+        else delete next[registrationId];
+        return next;
+      });
     }
-    setBusyId(null);
-    startTransition(() => router.refresh());
   }
 
   return (
@@ -124,11 +167,11 @@ export function TeamPaymentPanel({
         </Card>
       ) : null}
 
-      {error ? <p className="text-sm text-destructive">{error}</p> : null}
-
       {teams.map((team) => {
         const isCaptain = captainTeamIds.has(team.teamId);
-        const isBusy = busyId === team.registrationId;
+        const isBusy =
+          (busyCountByRegistration[team.registrationId] ?? 0) > 0;
+        const paymentError = errorByRegistration[team.registrationId];
         const canSubmit =
           isCaptain && team.payment.status === "unpaid" && !isOrganizer;
         const canConfirm =
@@ -172,6 +215,9 @@ export function TeamPaymentPanel({
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
+              {paymentError ? (
+                <p className="text-sm text-destructive">{paymentError}</p>
+              ) : null}
               {team.payment.submittedNote ? (
                 <p className="text-sm text-muted-foreground">
                   Captain note: {team.payment.submittedNote}
@@ -235,16 +281,23 @@ export function TeamPaymentPanel({
                     type="button"
                     size="sm"
                     disabled={isBusy}
-                    onClick={() =>
-                      void runAction(team.registrationId, () =>
-                        captainSubmitPayment({
-                          registrationId: team.registrationId,
-                          method:
-                            method[team.registrationId] ?? "venmo",
-                          note: note[team.registrationId] ?? "",
-                        })
-                      )
-                    }
+                    onClick={() => {
+                      const selectedMethod =
+                        method[team.registrationId] ?? "venmo";
+                      const selectedNote = note[team.registrationId] ?? "";
+                      void runAction(
+                        team.registrationId,
+                        `submit:${team.registrationId}`,
+                        JSON.stringify([selectedMethod, selectedNote.trim()]),
+                        (operationId) =>
+                          captainSubmitPayment({
+                            registrationId: team.registrationId,
+                            operationId,
+                            method: selectedMethod,
+                            note: selectedNote,
+                          })
+                      );
+                    }}
                   >
                     I&apos;ve sent payment
                   </Button>
@@ -260,8 +313,15 @@ export function TeamPaymentPanel({
                       variant="default"
                       disabled={isBusy}
                       onClick={() =>
-                        void runAction(team.registrationId, () =>
-                          hostConfirmPayment(team.registrationId)
+                        void runAction(
+                          team.registrationId,
+                          `confirm:${team.registrationId}`,
+                          "confirm",
+                          (operationId) =>
+                            hostConfirmPayment(
+                              team.registrationId,
+                              operationId
+                            )
                         )
                       }
                     >
@@ -276,8 +336,15 @@ export function TeamPaymentPanel({
                       variant="outline"
                       disabled={isBusy}
                       onClick={() =>
-                        void runAction(team.registrationId, () =>
-                          hostWaivePayment(team.registrationId)
+                        void runAction(
+                          team.registrationId,
+                          `waive:${team.registrationId}`,
+                          "waive",
+                          (operationId) =>
+                            hostWaivePayment(
+                              team.registrationId,
+                              operationId
+                            )
                         )
                       }
                     >

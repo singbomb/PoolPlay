@@ -20,21 +20,14 @@ import { Trophy } from "lucide-react";
 import type { InferSelectModel } from "drizzle-orm";
 import { asc, eq, and, inArray } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { divisions, tournaments, brackets, courts, teams, registrations } from "@/lib/db/schema";
+import { divisions, tournaments, courts, teams, registrations } from "@/lib/db/schema";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   resolveIsTournamentOrganizer,
   type UserForPermissions,
 } from "@/lib/tournaments/permissions";
-import {
-  ensureDivisionBracketSkeleton,
-  ensureTournamentCombinedBrackets,
-  repairBracketWinnerAdvances,
-  tournamentCombinedBracketsRegenerateState,
-  tryFillBracketFromDivisionSeeds,
-  tryFillTournamentCombinedBrackets,
-} from "@/lib/tournaments/bracket-structure";
+import { tournamentCombinedBracketsRegenerateState } from "@/lib/tournaments/bracket-structure";
 import { getDivisionPlayData } from "../brackets/data";
 import { BracketView } from "../brackets/bracket-view";
 import { BracketMatchAdmin } from "../brackets/bracket-match-admin";
@@ -51,48 +44,20 @@ export async function TournamentBracketPanel({
 }) {
   const isOrganizer = await resolveIsTournamentOrganizer(tournament, user);
 
-  const [tournamentDivisions, bracketIdRows] = await Promise.all([
-    db
-      .select({
-        id: divisions.id,
-        name: divisions.name,
-        format: divisions.format,
-        poolsReleasedAt: divisions.poolsReleasedAt,
-      })
-      .from(divisions)
-      .where(eq(divisions.tournamentId, tournament.id))
-      .orderBy(asc(divisions.createdAt), asc(divisions.id)),
-    db
-      .select({ id: brackets.id })
-      .from(brackets)
-      .innerJoin(divisions, eq(brackets.divisionId, divisions.id))
-      .where(eq(divisions.tournamentId, tournament.id)),
-  ]);
+  const tournamentDivisions = await db
+    .select({
+      id: divisions.id,
+      name: divisions.name,
+      format: divisions.format,
+      poolsReleasedAt: divisions.poolsReleasedAt,
+    })
+    .from(divisions)
+    .where(eq(divisions.tournamentId, tournament.id))
+    .orderBy(asc(divisions.createdAt), asc(divisions.id));
 
   const poolDivisions = tournamentDivisions.filter(
     (d) => d.format === "pool_to_bracket"
   );
-  const otherDivisions = tournamentDivisions.filter(
-    (d) =>
-      d.format === "single_elimination" || d.format === "double_elimination"
-  );
-
-  if (poolDivisions.length > 0) {
-    await ensureTournamentCombinedBrackets(tournament.id);
-    await tryFillTournamentCombinedBrackets(tournament.id);
-  }
-  if (isOrganizer) {
-    for (const div of otherDivisions) {
-      await ensureDivisionBracketSkeleton(div.id, div.format);
-      if (div.format === "single_elimination") {
-        await tryFillBracketFromDivisionSeeds(div.id);
-      }
-    }
-  }
-
-  for (const row of bracketIdRows) {
-    await repairBracketWinnerAdvances(row.id);
-  }
 
   const [tournamentCourts, registeredTeams] = await Promise.all([
     db

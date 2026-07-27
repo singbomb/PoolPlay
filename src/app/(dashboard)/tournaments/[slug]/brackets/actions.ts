@@ -29,21 +29,21 @@ import {
   registrations,
   pools,
   poolTeams,
+  schoolMembers,
+  users,
 } from "@/lib/db/schema";
-import { eq, and, count } from "drizzle-orm";
+import { eq, and, count, or, sql } from "drizzle-orm";
 import { requireUser } from "@/lib/auth";
-import type { UserForPermissions } from "@/lib/tournaments/permissions";
 import {
-  canAssignTeamsToPools,
   resolveIsTournamentOrganizer,
   poolAssignmentBlockedMessage,
 } from "@/lib/tournaments/permissions";
-import { regeneratePoolMatchesFromSeeds } from "@/lib/tournaments/pool-matches";
+import { regeneratePoolMatchesFromSeedsInTransaction } from "@/lib/tournaments/pool-matches";
 import {
   ensureDivisionBracketSkeleton,
   assignBracketRefsForBracket,
   countTournamentCombinedBracketTeams,
-  regenerateTournamentCombinedBrackets,
+  regenerateTournamentCombinedBracketsInTransaction,
   tournamentCombinedBracketsRegenerateState,
   tryFillBracketFromDivisionSeeds,
 } from "@/lib/tournaments/bracket-structure";
@@ -54,46 +54,68 @@ import {
 import { validateBracketTierSettings } from "@/lib/tournaments/bracket-tiers";
 import { assertMatchBelongsToAuthorizedTournament } from "@/lib/security/authorization-invariants";
 import { getMatchTournamentId } from "@/lib/tournaments/match-query";
+import { isTournamentArchived } from "@/lib/tournament-status";
+import {
+  OperationConflictError,
+  OperationValidationError,
+} from "@/lib/tournaments/competition-operation-rules";
 
-async function assertCanAssignTeamsToPools(
+type BracketActionDbClient = typeof db;
+
+function bracketOperationError(error: unknown, fallback: string): string {
+  if (
+    error instanceof OperationConflictError ||
+    error instanceof OperationValidationError
+  ) {
+    return error.message;
+  }
+  console.error(fallback, error);
+  return fallback;
+}
+
+async function loadLockedTournamentForOrganizer(
   tournamentId: string,
-  user: UserForPermissions
-) {
-  const [tournament] = await db
+  actorUserId: string,
+  executor: BracketActionDbClient
+): Promise<typeof tournaments.$inferSelect | null> {
+  await executor.execute(sql`
+    SELECT id
+    FROM ${tournaments}
+    WHERE ${tournaments.id} = ${tournamentId}
+    FOR UPDATE
+  `);
+  const [tournament] = await executor
     .select()
     .from(tournaments)
     .where(eq(tournaments.id, tournamentId))
     .limit(1);
-
-  if (!tournament) {
-    return { error: "Tournament not found" as const };
+  const [actor] = await executor
+    .select({ role: users.role, disabledAt: users.disabledAt })
+    .from(users)
+    .where(eq(users.id, actorUserId))
+    .for("share")
+    .limit(1);
+  if (!tournament || !actor || actor.disabledAt != null) return null;
+  if (tournament.organizerId === actorUserId || actor.role === "admin") {
+    return tournament;
   }
-
-  const [{ value: pendingCount }] = await db
-    .select({ value: count() })
-    .from(registrations)
+  if (!tournament.hostSchoolId) return null;
+  const [officer] = await executor
+    .select({ id: schoolMembers.id })
+    .from(schoolMembers)
     .where(
       and(
-        eq(registrations.tournamentId, tournamentId),
-        eq(registrations.status, "pending")
+        eq(schoolMembers.schoolId, tournament.hostSchoolId),
+        eq(schoolMembers.userId, actorUserId),
+        or(
+          eq(schoolMembers.role, "president"),
+          eq(schoolMembers.role, "officer")
+        )
       )
-    );
-
-  const pending = pendingCount ?? 0;
-
-  const blocked = poolAssignmentBlockedMessage(pending);
-  if (blocked) {
-    return { error: blocked };
-  }
-
-  if (!await canAssignTeamsToPools(tournament, user, pending)) {
-    return {
-      error:
-        "Pool seeding can only be updated after registration closes. Only the organizer can change seeds.",
-    };
-  }
-
-  return { tournament };
+    )
+    .for("share")
+    .limit(1);
+  return officer ? tournament : null;
 }
 
 /**
@@ -105,76 +127,114 @@ export async function updatePoolSeeding(
   orderedTeamIds: string[]
 ) {
   const user = await requireUser();
-
-  const [pool] = await db
-    .select({ divisionId: pools.divisionId })
-    .from(pools)
-    .where(eq(pools.id, poolId))
-    .limit(1);
-
-  if (!pool) return { error: "Pool not found" };
-
-  const [division] = await db
-    .select()
-    .from(divisions)
-    .where(eq(divisions.id, pool.divisionId))
-    .limit(1);
-
-  if (!division || division.tournamentId !== tournamentId) {
-    return { error: "Tournament mismatch" };
-  }
-
-  const gate = await assertCanAssignTeamsToPools(tournamentId, user);
-  if ("error" in gate) {
-    return { error: gate.error };
-  }
-
   const uniqueIds = [...new Set(orderedTeamIds)];
   if (uniqueIds.length < 2) {
     return { error: "Need at least 2 teams to set seeding" };
   }
 
-  const members = await db
-    .select({ teamId: poolTeams.teamId })
-    .from(poolTeams)
-    .where(eq(poolTeams.poolId, poolId));
+  let matchCount = 0;
+  try {
+    const result = await db.transaction(async (tx) => {
+      const executor = tx as unknown as BracketActionDbClient;
+      const tournament = await loadLockedTournamentForOrganizer(
+        tournamentId,
+        user.id,
+        executor
+      );
+      if (!tournament) {
+        return {
+          error:
+            "Pool seeding can only be updated by the current organizer.",
+        };
+      }
+      if (
+        tournament.status !== "registration_closed" ||
+        isTournamentArchived(tournament.date)
+      ) {
+        return {
+          error:
+            "Pool seeding can only be updated after registration closes.",
+        };
+      }
 
-  const memberIds = new Set(members.map((m) => m.teamId));
-  if (
-    uniqueIds.length !== members.length ||
-    uniqueIds.some((id) => !memberIds.has(id))
-  ) {
-    return { error: "Seeding must include every team in this pool" };
-  }
-
-  await db.transaction(async (tx) => {
-    for (let i = 0; i < uniqueIds.length; i++) {
-      await tx
-        .update(poolTeams)
-        .set({ seed: i + 1 })
+      const [{ value: pendingCount }] = await executor
+        .select({ value: count() })
+        .from(registrations)
         .where(
           and(
-            eq(poolTeams.poolId, poolId),
-            eq(poolTeams.teamId, uniqueIds[i])
+            eq(registrations.tournamentId, tournamentId),
+            eq(registrations.status, "pending")
           )
         );
-    }
-  });
+      const blocked = poolAssignmentBlockedMessage(pendingCount ?? 0);
+      if (blocked) return { error: blocked };
 
-  const matchResult = await regeneratePoolMatchesFromSeeds(poolId);
-  if (matchResult.error) {
-    return { error: matchResult.error };
-  }
+      const [division] = await executor
+        .select({
+          id: divisions.id,
+          tournamentId: divisions.tournamentId,
+          format: divisions.format,
+        })
+        .from(pools)
+        .innerJoin(divisions, eq(pools.divisionId, divisions.id))
+        .where(eq(pools.id, poolId))
+        .for("share")
+        .limit(1);
+      if (!division) return { error: "Pool not found" };
+      if (division.tournamentId !== tournamentId) {
+        return { error: "Tournament mismatch" };
+      }
 
-  if (division.format === "single_elimination") {
-    await tryFillBracketFromDivisionSeeds(division.id);
+      const members = await executor
+        .select({ teamId: poolTeams.teamId })
+        .from(poolTeams)
+        .where(eq(poolTeams.poolId, poolId))
+        .for("share");
+      const memberIds = new Set(members.map((member) => member.teamId));
+      if (
+        uniqueIds.length !== members.length ||
+        uniqueIds.some((id) => !memberIds.has(id))
+      ) {
+        return { error: "Seeding must include every team in this pool" };
+      }
+
+      for (let index = 0; index < uniqueIds.length; index += 1) {
+        await executor
+          .update(poolTeams)
+          .set({ seed: index + 1 })
+          .where(
+            and(
+              eq(poolTeams.poolId, poolId),
+              eq(poolTeams.teamId, uniqueIds[index])
+            )
+          );
+      }
+
+      const regenerated = await regeneratePoolMatchesFromSeedsInTransaction(
+        poolId,
+        executor
+      );
+      if (regenerated.error) {
+        throw new OperationValidationError(regenerated.error);
+      }
+      if (division.format === "single_elimination") {
+        await tryFillBracketFromDivisionSeeds(division.id, executor);
+      }
+      return { matchCount: regenerated.matchCount ?? 0 };
+    });
+    if ("error" in result) return { error: result.error };
+    matchCount = result.matchCount;
+  } catch (error) {
+    return {
+      error: bracketOperationError(error, "Could not update pool seeding"),
+    };
   }
 
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
   return {
     success: true as const,
-    matchCount: matchResult.matchCount ?? 0,
+    matchCount,
   };
 }
 
@@ -450,85 +510,125 @@ export async function updateTournamentBracketSettings(
     silverTeamCount = null;
   }
 
-  const totalTeams = await countTournamentCombinedBracketTeams(tournamentId);
-  if (totalTeams >= 2) {
-    const tierValidation = validateBracketTierSettings(
-      totalTeams,
-      bracketCount,
-      goldTeamCount,
-      silverTeamCount
-    );
-    if (!tierValidation.ok) {
-      return { error: tierValidation.error };
-    }
-  }
-
-  const poolDivisions = await db
-    .select({ id: divisions.id })
-    .from(divisions)
-    .where(
-      and(
-        eq(divisions.tournamentId, tournamentId),
-        eq(divisions.format, "pool_to_bracket")
-      )
-    );
-
-  const placed = await db
-    .select({ teamAId: matches.teamAId, teamBId: matches.teamBId })
-    .from(matches)
-    .innerJoin(brackets, eq(matches.bracketId, brackets.id))
-    .innerJoin(divisions, eq(brackets.divisionId, divisions.id))
-    .where(
-      and(
-        eq(divisions.tournamentId, tournamentId),
-        eq(divisions.format, "pool_to_bracket")
-      )
-    );
-
-  const hasTeams = placed.some((m) => m.teamAId != null || m.teamBId != null);
-
-  if (hasTeams) {
-    const regenerateState = await tournamentCombinedBracketsRegenerateState(
-      tournamentId
-    );
-    if (!regenerateState.canRegenerate) {
-      return {
-        error:
-          regenerateState.reason ??
-          "Bracket settings are locked while bracket play is in progress",
-      };
-    }
-  }
-
-  await db
-    .update(tournaments)
-    .set({
-      bracketCount,
-      goldTeamCount,
-      silverTeamCount,
-      bracketSettingsSavedAt: new Date(),
-      updatedAt: new Date(),
-    })
-    .where(eq(tournaments.id, tournamentId));
-
-  if (hasTeams) {
-    const result = await regenerateTournamentCombinedBrackets(tournamentId);
-    if (result.error) return { error: result.error };
-  } else if (poolDivisions.length > 0) {
-    for (const div of poolDivisions) {
-      const existing = await db
-        .select({ id: brackets.id })
-        .from(brackets)
-        .where(eq(brackets.divisionId, div.id));
-      for (const b of existing) {
-        await db.delete(matches).where(eq(matches.bracketId, b.id));
-        await db.delete(brackets).where(eq(brackets.id, b.id));
+  let rebuilt = false;
+  try {
+    const transactionResult = await db.transaction(async (tx) => {
+      const executor = tx as unknown as BracketActionDbClient;
+      const lockedTournament = await loadLockedTournamentForOrganizer(
+        tournamentId,
+        user.id,
+        executor
+      );
+      if (!lockedTournament) {
+        return { error: "Only the organizer can change bracket settings" };
       }
+
+      const totalTeams = await countTournamentCombinedBracketTeams(
+        tournamentId,
+        executor
+      );
+      if (totalTeams >= 2) {
+        const tierValidation = validateBracketTierSettings(
+          totalTeams,
+          bracketCount,
+          goldTeamCount,
+          silverTeamCount
+        );
+        if (!tierValidation.ok) return { error: tierValidation.error };
+      }
+
+      const poolDivisions = await executor
+        .select({ id: divisions.id })
+        .from(divisions)
+        .where(
+          and(
+            eq(divisions.tournamentId, tournamentId),
+            eq(divisions.format, "pool_to_bracket")
+          )
+        );
+      const placed = await executor
+        .select({ teamAId: matches.teamAId, teamBId: matches.teamBId })
+        .from(matches)
+        .innerJoin(brackets, eq(matches.bracketId, brackets.id))
+        .innerJoin(divisions, eq(brackets.divisionId, divisions.id))
+        .where(
+          and(
+            eq(divisions.tournamentId, tournamentId),
+            eq(divisions.format, "pool_to_bracket")
+          )
+        );
+      const hasTeams = placed.some(
+        (match) => match.teamAId != null || match.teamBId != null
+      );
+
+      if (hasTeams) {
+        const state = await tournamentCombinedBracketsRegenerateState(
+          tournamentId,
+          executor
+        );
+        if (!state.canRegenerate) {
+          return {
+            error:
+              state.reason ??
+              "Bracket settings are locked while bracket play is in progress",
+          };
+        }
+      }
+
+      await executor
+        .update(tournaments)
+        .set({
+          bracketCount,
+          goldTeamCount,
+          silverTeamCount,
+          bracketSettingsSavedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(tournaments.id, tournamentId));
+
+      if (hasTeams) {
+        const result =
+          await regenerateTournamentCombinedBracketsInTransaction(
+            tournamentId,
+            executor
+          );
+        if (result.error) {
+          throw new OperationValidationError(result.error);
+        }
+      } else if (poolDivisions.length > 0) {
+        for (const division of poolDivisions) {
+          const existing = await executor
+            .select({ id: brackets.id })
+            .from(brackets)
+            .where(eq(brackets.divisionId, division.id));
+          for (const bracket of existing) {
+            await executor
+              .delete(matches)
+              .where(eq(matches.bracketId, bracket.id));
+            await executor
+              .delete(brackets)
+              .where(eq(brackets.id, bracket.id));
+          }
+        }
+        await ensureDivisionBracketSkeleton(
+          poolDivisions[0].id,
+          "pool_to_bracket",
+          executor
+        );
+      }
+      return { rebuilt: hasTeams || poolDivisions.length > 0 };
+    });
+    if ("error" in transactionResult) {
+      return { error: transactionResult.error };
     }
-    await ensureDivisionBracketSkeleton(
-      poolDivisions[0].id,
-      "pool_to_bracket"
-    );
+    rebuilt = transactionResult.rebuilt;
+  } catch (error) {
+    return {
+      error: bracketOperationError(
+        error,
+        "Could not update bracket settings"
+      ),
+    };
   }
 
   revalidatePath("/tournaments/[slug]", "page");
@@ -537,7 +637,7 @@ export async function updateTournamentBracketSettings(
     bracketCount,
     goldTeamCount,
     silverTeamCount,
-    rebuilt: hasTeams || poolDivisions.length > 0,
+    rebuilt,
   };
 }
 
@@ -555,8 +655,28 @@ export async function regenerateTournamentBrackets(tournamentId: string) {
     return { error: "Only the organizer can regenerate brackets" };
   }
 
-  const result = await regenerateTournamentCombinedBrackets(tournamentId);
-  if (result.error) return { error: result.error };
+  try {
+    const result = await db.transaction(async (tx) => {
+      const executor = tx as unknown as BracketActionDbClient;
+      const lockedTournament = await loadLockedTournamentForOrganizer(
+        tournamentId,
+        user.id,
+        executor
+      );
+      if (!lockedTournament) {
+        return { error: "Only the organizer can regenerate brackets" };
+      }
+      return regenerateTournamentCombinedBracketsInTransaction(
+        tournamentId,
+        executor
+      );
+    });
+    if (result.error) return { error: result.error };
+  } catch (error) {
+    return {
+      error: bracketOperationError(error, "Could not regenerate brackets"),
+    };
+  }
 
   revalidatePath("/tournaments/[slug]", "page");
   return { success: true as const };

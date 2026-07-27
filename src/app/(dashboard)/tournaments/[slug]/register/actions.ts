@@ -22,7 +22,6 @@ import { revalidatePath } from "next/cache";
 import { db } from "@/lib/db";
 import {
   registrations,
-  teamMembers,
   tournaments,
   teams,
   schools,
@@ -31,97 +30,30 @@ import { eq, and, notInArray, asc } from "drizzle-orm";
 import {
   isSchoolVerifiedForTournament,
   SCHOOL_NOT_VERIFIED_FOR_TOURNAMENT_ERROR,
-  teamRegistrationBlockReason,
 } from "@/lib/tournaments/registration-eligibility";
 import { requireUser } from "@/lib/auth";
 import {
   canRegisterTeams,
-  canWithdrawRegistration,
   resolveIsTournamentOrganizer,
-  registrationGenderMismatchMessage,
-  teamMatchesTournamentGender,
 } from "@/lib/tournaments/permissions";
-import { syncDivisionAutoPoolMembers } from "@/lib/tournaments/division-pools";
-
 import {
-  getFirstDivisionId,
-  insertTeamRegistration,
+  MAX_TEAM_REGISTRATION_BATCH_SIZE,
+  registerTeamsAtomically,
 } from "@/lib/tournaments/registrations";
-import { createRegistrationPayment } from "@/lib/tournaments/payment-compliance";
+import { withdrawRegistrationAtomically } from "@/lib/tournaments/registration-roster-mutations";
+import {
+  OperationConflictError,
+  OperationValidationError,
+} from "@/lib/tournaments/competition-operation-rules";
 
-type TournamentRow = typeof tournaments.$inferSelect;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-async function validateTeamRegistration(
-  user: Awaited<ReturnType<typeof requireUser>>,
-  tournament: TournamentRow,
-  teamId: string,
-  isHost: boolean
-): Promise<{ error: string } | { ok: true }> {
-  const [team] = await db
-    .select({
-      id: teams.id,
-      gender: teams.gender,
-      schoolId: teams.schoolId,
-      schoolVerificationStatus: schools.verificationStatus,
-      teamVerificationStatus: teams.verificationStatus,
-    })
-    .from(teams)
-    .leftJoin(schools, eq(teams.schoolId, schools.id))
-    .where(eq(teams.id, teamId))
-    .limit(1);
-
-  if (!team) {
-    return { error: "Team not found" };
-  }
-
-  const registrationBlock = teamRegistrationBlockReason(
-    team.schoolId,
-    team.schoolVerificationStatus,
-    team.teamVerificationStatus
-  );
-  if (registrationBlock) {
-    return { error: registrationBlock };
-  }
-
-  if (!teamMatchesTournamentGender(team.gender, tournament.gender)) {
-    return { error: registrationGenderMismatchMessage(tournament.gender) };
-  }
-
-  if (!isHost) {
-    const [membership] = await db
-      .select()
-      .from(teamMembers)
-      .where(
-        and(eq(teamMembers.teamId, teamId), eq(teamMembers.userId, user.id))
-      );
-
-    if (!membership || membership.role !== "captain") {
-      return {
-        error:
-          "Only team captains or the tournament host can register teams for this event",
-      };
-    }
-  }
-
-  const [existing] = await db
-    .select({ id: registrations.id })
-    .from(registrations)
-    .where(
-      and(
-        eq(registrations.teamId, teamId),
-        eq(registrations.tournamentId, tournament.id)
-      )
-    )
-    .limit(1);
-
-  if (existing) {
-    return { error: "This team is already registered for this tournament" };
-  }
-
-  return { ok: true };
-}
-
-export async function registerTeams(tournamentId: string, teamIds: string[]) {
+export async function registerTeams(
+  tournamentId: string,
+  teamIds: string[],
+  operationId: string
+) {
   const user = await requireUser();
   const uniqueIds = [...new Set(teamIds.filter(Boolean))];
 
@@ -129,80 +61,51 @@ export async function registerTeams(tournamentId: string, teamIds: string[]) {
     return { error: "Select at least one team" };
   }
 
-  const [tournament] = await db
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, tournamentId))
-    .limit(1);
-
-  if (!tournament) {
-    return { error: "Tournament not found" };
+  if (!UUID_RE.test(tournamentId)) {
+    return { error: "Tournament ID is invalid." };
   }
-
-  if (!canRegisterTeams(tournament)) {
+  if (uniqueIds.length > MAX_TEAM_REGISTRATION_BATCH_SIZE) {
     return {
-      error:
-        "Registration is not open for this tournament. Contact the host if you need to sign up.",
+      error: `Select no more than ${MAX_TEAM_REGISTRATION_BATCH_SIZE} teams at once.`,
     };
   }
-
-  const isHost = await resolveIsTournamentOrganizer(tournament, user);
-
-  for (const teamId of uniqueIds) {
-    const validation = await validateTeamRegistration(
-      user,
-      tournament,
-      teamId,
-      isHost
-    );
-    if ("error" in validation) {
-      return { error: validation.error };
-    }
+  if (uniqueIds.some((teamId) => !UUID_RE.test(teamId))) {
+    return { error: "One or more team IDs are invalid." };
+  }
+  if (!UUID_RE.test(operationId)) {
+    return { error: "Could not start registration. Try again." };
   }
 
-  const firstDivisionId = await getFirstDivisionId(tournamentId);
-
+  let result: Awaited<ReturnType<typeof registerTeamsAtomically>>;
   try {
-    for (const teamId of uniqueIds) {
-      const [team] = await db
-        .select({ schoolId: teams.schoolId })
-        .from(teams)
-        .where(eq(teams.id, teamId))
-        .limit(1);
-
-      const registrationId = await insertTeamRegistration(
-        tournamentId,
-        teamId,
-        isHost ? "confirmed" : "pending",
-        firstDivisionId
-      );
-
-      await createRegistrationPayment(
-        tournament,
-        registrationId,
-        teamId,
-        team?.schoolId ?? null,
-        isHost
-          ? { hostWaived: true, hostUserId: user.id }
-          : undefined
-      );
-    }
+    result = await registerTeamsAtomically({
+      tournamentId,
+      teamIds: uniqueIds,
+      actor: user,
+      operationId,
+    });
   } catch (e) {
-    return {
-      error:
-        e instanceof Error
-          ? e.message
-          : "Could not register teams. Try again.",
-    };
+    if (
+      e instanceof OperationConflictError ||
+      e instanceof OperationValidationError
+    ) {
+      return { error: e.message };
+    }
+    console.error("Team registration failed", e);
+    return { error: "Could not register teams. Try again." };
   }
 
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/register", "page");
-  return { success: true as const, count: uniqueIds.length };
+  return { success: true as const, count: result.count };
 }
 
-export async function registerTeam(tournamentId: string, teamId: string) {
-  const result = await registerTeams(tournamentId, [teamId]);
+export async function registerTeam(
+  tournamentId: string,
+  teamId: string,
+  operationId: string
+) {
+  const result = await registerTeams(tournamentId, [teamId], operationId);
   if ("error" in result && result.error) {
     return { error: result.error };
   }
@@ -215,59 +118,21 @@ export async function withdrawRegistration(
 ) {
   const user = await requireUser();
 
-  const [tournament] = await db
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, tournamentId))
-    .limit(1);
-
-  if (!tournament) {
-    return { error: "Tournament not found" };
-  }
-
-  if (!canWithdrawRegistration(tournament)) {
-    return { error: "Registration can no longer be withdrawn for this event." };
-  }
-
-  const isHost = await resolveIsTournamentOrganizer(tournament, user);
-
-  if (!isHost) {
-    const [membership] = await db
-      .select()
-      .from(teamMembers)
-      .where(
-        and(eq(teamMembers.teamId, teamId), eq(teamMembers.userId, user.id))
-      )
-      .limit(1);
-
-    if (!membership || membership.role !== "captain") {
-      return {
-        error: "Only team captains or the tournament host can withdraw a team",
-      };
+  try {
+    await withdrawRegistrationAtomically({
+      tournamentId,
+      teamId,
+      actorUserId: user.id,
+    });
+  } catch (error) {
+    if (
+      error instanceof OperationConflictError ||
+      error instanceof OperationValidationError
+    ) {
+      return { error: error.message };
     }
-  }
-
-  const [reg] = await db
-    .select()
-    .from(registrations)
-    .where(
-      and(
-        eq(registrations.tournamentId, tournamentId),
-        eq(registrations.teamId, teamId)
-      )
-    )
-    .limit(1);
-
-  if (!reg) {
-    return { error: "This team is not registered for this tournament" };
-  }
-
-  const removedDivisionId = reg.divisionId;
-
-  await db.delete(registrations).where(eq(registrations.id, reg.id));
-
-  if (removedDivisionId) {
-    await syncDivisionAutoPoolMembers(tournamentId, removedDivisionId);
+    console.error("Registration withdrawal failed", error);
+    return { error: "Could not withdraw this registration. Try again." };
   }
 
   revalidatePath("/tournaments/[slug]", "page");

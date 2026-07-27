@@ -91,4 +91,10 @@ cd "${repository_root}"
 POOLPLAY_BOOTSTRAP_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/postgres" \
   node --import tsx scripts/database/verify-schema.ts
 
+POOLPLAY_BOOTSTRAP_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/postgres" \
+  node --import tsx scripts/database/verify-operation-concurrency.ts
+
+POOLPLAY_BOOTSTRAP_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/postgres" \
+  node --import tsx scripts/database/verify-registration-roster-concurrency.ts
+
 echo "Clean database bootstrap verified."

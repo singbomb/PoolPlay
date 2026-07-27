@@ -27,6 +27,7 @@ import {
   courts,
   courtDivisions,
   users,
+  schoolMembers,
   registrations,
   matches,
   pools,
@@ -56,24 +57,54 @@ import {
   waiverBlocksCheckIn,
 } from "@/lib/tournaments/waiver-compliance";
 import { waiverSettingsFromTournament } from "@/lib/tournaments/waiver-access";
-import { paymentSettingsFromTournament } from "@/lib/tournaments/payment-access";
-import {
-  getPaymentsByRegistrationIds,
-  paymentBlocksConfirm,
-} from "@/lib/tournaments/payment-compliance";
 import {
   ensureDivisionAutoPool,
-  syncDivisionAutoPoolMembers,
-  syncManyDivisionPools,
 } from "@/lib/tournaments/division-pools";
 import { ensureDivisionBracketSkeleton } from "@/lib/tournaments/bracket-structure";
 import { assertChildBelongsToAuthorizedParent } from "@/lib/security/authorization-invariants";
+import { transitionRegistrationStatuses } from "@/lib/tournaments/registration-transitions";
+import {
+  assignRegistrationsToDivisionAtomically,
+  removeDivisionPreservingRegistrationsAtomically,
+  removeRegistrationsAtomically,
+} from "@/lib/tournaments/registration-roster-mutations";
+import {
+  OperationConflictError,
+  OperationValidationError,
+} from "@/lib/tournaments/competition-operation-rules";
+import {
+  DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE,
+  isCreatablePlayFormat,
+} from "@/lib/labels/play-format";
 import type { TournamentStatus } from "@/types";
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function competitionOperationError(error: unknown): string {
+  if (
+    error instanceof OperationConflictError ||
+    error instanceof OperationValidationError
+  ) {
+    return error.message;
+  }
+  console.error("Competition operation failed", error);
+  return "Could not update registrations. Try again.";
+}
 
 export async function createTournament(formData: FormData) {
   const user = await requireUser();
+  const requestedPlayFormat =
+    formData.get("playFormat") || "pool_to_bracket";
+  if (!isCreatablePlayFormat(requestedPlayFormat)) {
+    return {
+      error:
+        requestedPlayFormat === "double_elimination"
+          ? DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE
+          : "Choose a supported tournament format",
+    };
+  }
 
   const parsed = createTournamentSchema.safeParse({
     hostSchoolId: formData.get("hostSchoolId"),
@@ -82,7 +113,7 @@ export async function createTournament(formData: FormData) {
     date: formData.get("date"),
     location: formData.get("location"),
     address: formData.get("address") || undefined,
-    playFormat: formData.get("playFormat") || "pool_to_bracket",
+    playFormat: requestedPlayFormat,
   });
 
   if (!parsed.success) {
@@ -117,32 +148,39 @@ export async function createTournament(formData: FormData) {
     existingSlugs.map((t) => t.slug)
   );
 
-  const [tournament] = await db
-    .insert(tournaments)
-    .values({
-      organizerId: user.id,
-      hostSchoolId: hostSchool.id,
-      gender: hostSchool.gender,
-      region: hostSchool.region,
-      name: parsed.data.name,
-      slug,
-      description: parsed.data.description || null,
-      date: parsed.data.date,
-      location: parsed.data.location,
-      address: parsed.data.address || null,
-      playFormat: parsed.data.playFormat,
-      status: "draft",
-    })
-    .returning();
+  const tournament = await db.transaction(async (tx) => {
+    const [created] = await tx
+      .insert(tournaments)
+      .values({
+        organizerId: user.id,
+        hostSchoolId: hostSchool.id,
+        gender: hostSchool.gender,
+        region: hostSchool.region,
+        name: parsed.data.name,
+        slug,
+        description: parsed.data.description || null,
+        date: parsed.data.date,
+        location: parsed.data.location,
+        address: parsed.data.address || null,
+        playFormat: parsed.data.playFormat,
+        status: "draft",
+      })
+      .returning();
 
-  if (user.role !== "organizer") {
-    await db
-      .update(users)
-      .set({ role: "organizer" })
-      .where(eq(users.id, user.id));
-  }
-
-  await registerHostSchoolTeamsOnCreate(tournament.id, hostSchool.id);
+    if (user.role !== "organizer") {
+      await tx
+        .update(users)
+        .set({ role: "organizer" })
+        .where(eq(users.id, user.id));
+    }
+    await registerHostSchoolTeamsOnCreate(
+      created.id,
+      hostSchool.id,
+      user.id,
+      tx as unknown as typeof db
+    );
+    return created;
+  });
 
   redirect(`/tournaments/${tournament.slug}`);
 }
@@ -408,6 +446,62 @@ export async function deleteTournament(
 
   try {
     await db.transaction(async (tx) => {
+      const [lockedTournament] = await tx
+        .select()
+        .from(tournaments)
+        .where(eq(tournaments.id, tournamentId))
+        .for("update")
+        .limit(1);
+      if (!lockedTournament) {
+        throw new OperationConflictError(
+          "Tournament no longer exists. Refresh and try again."
+        );
+      }
+      const [currentUser] = await tx
+        .select({ role: users.role, disabledAt: users.disabledAt })
+        .from(users)
+        .where(eq(users.id, user.id))
+        .for("share")
+        .limit(1);
+      let authorized =
+        currentUser != null &&
+        currentUser.disabledAt == null &&
+        (lockedTournament.organizerId === user.id ||
+          currentUser.role === "admin");
+      if (
+        !authorized &&
+        currentUser != null &&
+        currentUser.disabledAt == null &&
+        lockedTournament.hostSchoolId
+      ) {
+        const [officer] = await tx
+          .select({ id: schoolMembers.id })
+          .from(schoolMembers)
+          .where(
+            and(
+              eq(schoolMembers.schoolId, lockedTournament.hostSchoolId),
+              eq(schoolMembers.userId, user.id),
+              or(
+                eq(schoolMembers.role, "president"),
+                eq(schoolMembers.role, "officer")
+              )
+            )
+          )
+          .for("share")
+          .limit(1);
+        authorized = officer != null;
+      }
+      if (!authorized) {
+        throw new OperationValidationError(
+          "Only the current organizer can delete this tournament."
+        );
+      }
+      if (lockedTournament.name.trim() !== confirmationName.trim()) {
+        throw new OperationValidationError(
+          "Tournament name changed. Type the current name exactly and try again."
+        );
+      }
+
       const poolRows = await tx
         .select({ id: pools.id })
         .from(pools)
@@ -448,7 +542,13 @@ export async function deleteTournament(
 
       await tx.delete(tournaments).where(eq(tournaments.id, tournamentId));
     });
-  } catch {
+  } catch (error) {
+    if (
+      error instanceof OperationConflictError ||
+      error instanceof OperationValidationError
+    ) {
+      return { error: error.message };
+    }
     return { error: "Could not delete tournament. Try again." };
   }
 
@@ -567,6 +667,12 @@ export async function addDivision(tournamentId: string, formData: FormData) {
         "Pools cannot be edited in the current tournament stage. Complete setup before the event starts.",
     };
   }
+  if (!isCreatablePlayFormat(tournament.playFormat)) {
+    return {
+      error:
+        "New pools cannot be added to a legacy double-elimination tournament.",
+    };
+  }
 
   const parsed = createDivisionSchema.safeParse({
     name: formData.get("name"),
@@ -630,27 +736,15 @@ export async function removeDivision(tournamentId: string, divisionId: string) {
     return { error: "Pools cannot be removed in the current tournament stage." };
   }
 
-  const [removedDivision] = await db
-    .delete(divisions)
-    .where(
-      and(
-        eq(divisions.id, divisionId),
-        eq(divisions.tournamentId, tournamentId)
-      )
-    )
-    .returning({
-      id: divisions.id,
-      tournamentId: divisions.tournamentId,
+  try {
+    await removeDivisionPreservingRegistrationsAtomically({
+      tournamentId,
+      divisionId,
+      actorUserId: user.id,
     });
-
-  if (!removedDivision) {
-    return { error: "Resource not found or access denied" };
+  } catch (error) {
+    return { error: competitionOperationError(error) };
   }
-
-  assertChildBelongsToAuthorizedParent({
-    childParentId: removedDivision.tournamentId,
-    authorizedParentId: tournamentId,
-  });
 
   revalidatePath("/tournaments/[slug]", "page");
   return { success: true };
@@ -805,9 +899,14 @@ export async function removeCourt(tournamentId: string, courtId: string) {
 
 export async function updateRegistrationStatus(
   registrationId: string,
-  status: "confirmed" | "pending" | "checked_in"
+  status: "confirmed" | "pending" | "checked_in",
+  operationId: string
 ) {
   const user = await requireUser();
+
+  if (!UUID_RE.test(operationId)) {
+    return { error: "Could not start this update. Try again." };
+  }
 
   const [reg] = await db
     .select()
@@ -847,26 +946,17 @@ export async function updateRegistrationStatus(
     };
   }
 
-  if (status === "confirmed") {
-    const paymentSettings = paymentSettingsFromTournament(tournament);
-    const payments = await getPaymentsByRegistrationIds([registrationId]);
-    const payment = payments.get(registrationId);
-    if (paymentBlocksConfirm(paymentSettings, payment)) {
-      const label =
-        payment?.status === "submitted"
-          ? "Payment submitted — confirm or waive before approving registration."
-          : "Payment required before confirming this registration.";
-      return { error: label };
-    }
-  }
-
-  await db
-    .update(registrations)
-    .set({ status })
-    .where(eq(registrations.id, registrationId));
-
-  if (reg.divisionId) {
-    await syncDivisionAutoPoolMembers(reg.tournamentId, reg.divisionId);
+  try {
+    await transitionRegistrationStatuses({
+      tournamentId: reg.tournamentId,
+      registrationIds: [registrationId],
+      toStatus: status,
+      actorUserId: user.id,
+      operationId,
+      reason: "Organizer changed registration status",
+    });
+  } catch (error) {
+    return { error: competitionOperationError(error) };
   }
 
   revalidatePath("/tournaments/[slug]", "page");
@@ -877,12 +967,16 @@ export async function updateRegistrationStatus(
 /** Confirm multiple pending registrations in one action (e.g. all teams from a school). */
 export async function confirmPendingRegistrations(
   tournamentId: string,
-  registrationIds: string[]
+  registrationIds: string[],
+  operationId: string
 ) {
   const user = await requireUser();
   const uniqueIds = [...new Set(registrationIds)];
   if (uniqueIds.length === 0) {
     return { error: "No registrations selected" };
+  }
+  if (!UUID_RE.test(operationId)) {
+    return { error: "Could not start this update. Try again." };
   }
 
   const [tournament] = await db
@@ -901,49 +995,24 @@ export async function confirmPendingRegistrations(
     };
   }
 
-  const rows = await db
-    .select({ id: registrations.id, divisionId: registrations.divisionId })
-    .from(registrations)
-    .where(
-      and(
-        eq(registrations.tournamentId, tournamentId),
-        inArray(registrations.id, uniqueIds),
-        eq(registrations.status, "pending")
-      )
-    );
-
-  if (rows.length !== uniqueIds.length) {
-    return {
-      error: "Some registrations are missing or no longer pending",
-    };
+  let count: number;
+  try {
+    const result = await transitionRegistrationStatuses({
+      tournamentId,
+      registrationIds: uniqueIds,
+      toStatus: "confirmed",
+      actorUserId: user.id,
+      operationId,
+      reason: "Organizer confirmed pending registrations",
+    });
+    count = result.count;
+  } catch (error) {
+    return { error: competitionOperationError(error) };
   }
-
-  const paymentSettings = paymentSettingsFromTournament(tournament);
-  if (paymentSettings.enabled && paymentSettings.requiredBeforeConfirm) {
-    const payments = await getPaymentsByRegistrationIds(uniqueIds);
-    const blocked = uniqueIds.filter((id) =>
-      paymentBlocksConfirm(paymentSettings, payments.get(id))
-    );
-    if (blocked.length > 0) {
-      return {
-        error: `Payment required before confirming ${blocked.length} registration${blocked.length === 1 ? "" : "s"}. Mark paid or waive on the Payment tab.`,
-      };
-    }
-  }
-
-  await db
-    .update(registrations)
-    .set({ status: "confirmed" })
-    .where(inArray(registrations.id, uniqueIds));
-
-  await syncManyDivisionPools(
-    tournamentId,
-    rows.map((r) => r.divisionId)
-  );
 
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
-  return { success: true as const, count: rows.length };
+  return { success: true as const, count };
 }
 
 export async function updateDivision(
@@ -1108,29 +1177,16 @@ export async function setRegistrationDivision(
     };
   }
 
-  if (divisionId) {
-    const [div] = await db
-      .select()
-      .from(divisions)
-      .where(eq(divisions.id, divisionId))
-      .limit(1);
-
-    if (!div || div.tournamentId !== reg.tournamentId) {
-      return { error: "Invalid pool for this tournament" };
-    }
+  try {
+    await assignRegistrationsToDivisionAtomically({
+      tournamentId: reg.tournamentId,
+      registrationIds: [registrationId],
+      divisionId,
+      actorUserId: user.id,
+    });
+  } catch (error) {
+    return { error: competitionOperationError(error) };
   }
-
-  const previousDivisionId = reg.divisionId;
-
-  await db
-    .update(registrations)
-    .set({ divisionId })
-    .where(eq(registrations.id, registrationId));
-
-  await syncManyDivisionPools(reg.tournamentId, [
-    previousDivisionId,
-    divisionId,
-  ]);
 
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
@@ -1165,48 +1221,22 @@ export async function bulkAssignRegistrationsToDivision(
     };
   }
 
-  if (divisionId) {
-    const [div] = await db
-      .select({ id: divisions.id, tournamentId: divisions.tournamentId })
-      .from(divisions)
-      .where(eq(divisions.id, divisionId))
-      .limit(1);
-    if (!div || div.tournamentId !== tournamentId) {
-      return { error: "Invalid pool for this tournament" };
-    }
+  let count: number;
+  try {
+    const result = await assignRegistrationsToDivisionAtomically({
+      tournamentId,
+      registrationIds: uniqueIds,
+      divisionId,
+      actorUserId: user.id,
+    });
+    count = result.count;
+  } catch (error) {
+    return { error: competitionOperationError(error) };
   }
-
-  const rows = await db
-    .select({ id: registrations.id, divisionId: registrations.divisionId })
-    .from(registrations)
-    .where(
-      and(
-        eq(registrations.tournamentId, tournamentId),
-        inArray(registrations.id, uniqueIds)
-      )
-    );
-  if (rows.length !== uniqueIds.length) {
-    return { error: "Some registrations no longer exist" };
-  }
-
-  await db
-    .update(registrations)
-    .set({ divisionId })
-    .where(
-      and(
-        eq(registrations.tournamentId, tournamentId),
-        inArray(registrations.id, uniqueIds)
-      )
-    );
-
-  await syncManyDivisionPools(tournamentId, [
-    divisionId,
-    ...rows.map((r) => r.divisionId),
-  ]);
 
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
-  return { success: true as const, count: rows.length };
+  return { success: true as const, count };
 }
 
 /** Host-only: delete multiple registrations from a tournament at once. */
@@ -1236,33 +1266,20 @@ export async function bulkRemoveRegistrations(
     };
   }
 
-  const targetRows = await db
-    .select({ id: registrations.id, divisionId: registrations.divisionId })
-    .from(registrations)
-    .where(
-      and(
-        eq(registrations.tournamentId, tournamentId),
-        inArray(registrations.id, uniqueIds)
-      )
-    );
-
-  const result = await db
-    .delete(registrations)
-    .where(
-      and(
-        eq(registrations.tournamentId, tournamentId),
-        inArray(registrations.id, uniqueIds)
-      )
-    )
-    .returning({ id: registrations.id });
-
-  await syncManyDivisionPools(
-    tournamentId,
-    targetRows.map((r) => r.divisionId)
-  );
+  let count: number;
+  try {
+    const result = await removeRegistrationsAtomically({
+      tournamentId,
+      registrationIds: uniqueIds,
+      actorUserId: user.id,
+    });
+    count = result.count;
+  } catch (error) {
+    return { error: competitionOperationError(error) };
+  }
 
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/register", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
-  return { success: true as const, count: result.length };
+  return { success: true as const, count };
 }

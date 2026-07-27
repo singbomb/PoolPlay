@@ -24,6 +24,22 @@ export const PLAY_FORMATS = [
 
 export type PlayFormat = (typeof PLAY_FORMATS)[number];
 
+export const CREATABLE_PLAY_FORMATS = [
+  "pool_to_bracket",
+  "single_elimination",
+] as const satisfies readonly PlayFormat[];
+
+export type CreatablePlayFormat = (typeof CREATABLE_PLAY_FORMATS)[number];
+
+export const DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE =
+  "Double elimination is not available for new tournaments yet.";
+
+export function isCreatablePlayFormat(
+  value: unknown
+): value is CreatablePlayFormat {
+  return CREATABLE_PLAY_FORMATS.includes(value as CreatablePlayFormat);
+}
+
 const PLAY_FORMAT_LABELS: Record<PlayFormat, string> = {
   pool_to_bracket: "Group play to bracket",
   single_elimination: "Single elimination",
@@ -53,7 +69,7 @@ export function playFormatDescription(format: PlayFormat | string): string {
   );
 }
 
-export const PLAY_FORMAT_OPTIONS = PLAY_FORMATS.map((value) => ({
+export const PLAY_FORMAT_OPTIONS = CREATABLE_PLAY_FORMATS.map((value) => ({
   value,
   label: PLAY_FORMAT_LABELS[value],
   description: PLAY_FORMAT_DESCRIPTIONS[value],

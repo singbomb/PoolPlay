@@ -19,6 +19,8 @@
  */
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -55,6 +57,7 @@ interface ScoringMatch {
   courtName: string | null;
   refTeamName: string | null;
   winnerId: string | null;
+  scoreRevision: number;
   sets: MatchSet[];
 }
 
@@ -78,12 +81,14 @@ export function ScoringCard({
   match: ScoringMatch;
   canScore: boolean;
 } & MatchFormatProps) {
+  const router = useRouter();
   const [newSetNumber, setNewSetNumber] = useState(
     (match.sets.length || 0) + 1
   );
   const [teamAScore, setTeamAScore] = useState(setStartingScore);
   const [teamBScore, setTeamBScore] = useState(setStartingScore);
   const [loading, setLoading] = useState(false);
+  const [scoreRevision, setScoreRevision] = useState(match.scoreRevision);
 
   const { max: maxSets } = totalSetsForFormat(matchFormat);
   const targetThisSet = targetForSet(
@@ -103,23 +108,66 @@ export function ScoringCard({
     formData.set("setNumber", String(newSetNumber));
     formData.set("teamAScore", String(teamAScore));
     formData.set("teamBScore", String(teamBScore));
-    await updateScore(formData);
+    formData.set("expectedRevision", String(scoreRevision));
+    const result = await updateScore(formData);
+    if (result?.error) {
+      toast.error(result.error);
+      setLoading(false);
+      router.refresh();
+      return;
+    }
+    if (result?.nextRevision == null) {
+      toast.error("Could not confirm the saved score. Refresh and try again.");
+      setLoading(false);
+      router.refresh();
+      return;
+    }
+    setScoreRevision(result.nextRevision);
     setNewSetNumber((prev) => prev + 1);
     setTeamAScore(setStartingScore);
     setTeamBScore(setStartingScore);
     setLoading(false);
+    router.refresh();
   }
 
   async function handleFinalize(winnerId: string) {
     setLoading(true);
-    await finalizeMatch(match.id, winnerId);
+    const result = await finalizeMatch(match.id, winnerId, scoreRevision);
+    if (result?.error) {
+      toast.error(result.error);
+      setLoading(false);
+      router.refresh();
+      return;
+    }
+    if (result?.nextRevision == null) {
+      toast.error("Could not confirm the match result. Refresh and try again.");
+      setLoading(false);
+      router.refresh();
+      return;
+    }
+    setScoreRevision(result.nextRevision);
     setLoading(false);
+    router.refresh();
   }
 
   async function handleStart() {
     setLoading(true);
-    await startMatch(match.id);
+    const result = await startMatch(match.id, scoreRevision);
+    if (result?.error) {
+      toast.error(result.error);
+      setLoading(false);
+      router.refresh();
+      return;
+    }
+    if (result?.nextRevision == null) {
+      toast.error("Could not confirm the match start. Refresh and try again.");
+      setLoading(false);
+      router.refresh();
+      return;
+    }
+    setScoreRevision(result.nextRevision);
     setLoading(false);
+    router.refresh();
   }
 
   const teamASetsWon = match.sets.filter(

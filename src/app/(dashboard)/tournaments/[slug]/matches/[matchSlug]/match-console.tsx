@@ -18,7 +18,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { format as formatDate } from "date-fns";
@@ -77,6 +77,7 @@ interface ConsoleMatch {
   warmupStartedAt: string | null;
   startedAt: string | null;
   winnerId: string | null;
+  scoreRevision: number;
   teamA: { id: string; name: string } | null;
   teamB: { id: string; name: string } | null;
   refTeamName: string | null;
@@ -142,32 +143,32 @@ export function MatchConsole({
   const hasTeams = Boolean(match.teamA && match.teamB);
 
   const [busy, setBusy] = useState(false);
+  const scoreRevisionRef = useRef(match.scoreRevision);
   /** Local only: which side is left/right for the ref's view of the court. */
   const [sidesFlipped, setSidesFlipped] = useState(false);
-  /** Set shown in the scorekeeper; may be a previous set for corrections. */
-  const [selectedSetNumber, setSelectedSetNumber] = useState(liveSetNumber);
-  const prevLiveSetRef = useRef(liveSetNumber);
+  /** Explicit past-set selection; null means follow the live set automatically. */
+  const [pastSetSelection, setPastSetSelection] = useState<{
+    matchId: string;
+    setNumber: number;
+  } | null>(null);
+  const handleScoreRevisionChange = useCallback((revision: number) => {
+    scoreRevisionRef.current = revision;
+  }, []);
 
   useEffect(() => {
-    setSelectedSetNumber(liveSetNumber);
-  }, [match.id]);
+    scoreRevisionRef.current = match.scoreRevision;
+  }, [match.scoreRevision]);
 
-  // Follow the live set when it advances, unless the ref is editing an older set.
-  useEffect(() => {
-    const prevLive = prevLiveSetRef.current;
-    if (
-      liveSetNumber !== prevLive &&
-      selectedSetNumber === prevLive
-    ) {
-      setSelectedSetNumber(liveSetNumber);
-    }
-    prevLiveSetRef.current = liveSetNumber;
-  }, [liveSetNumber, selectedSetNumber]);
-
-  const activeSetNumber = Math.min(
-    Math.max(selectedSetNumber, 1),
-    liveSetNumber
-  );
+  const activeSetNumber =
+    pastSetSelection?.matchId === match.id &&
+    pastSetSelection.setNumber < liveSetNumber
+      ? Math.max(pastSetSelection.setNumber, 1)
+      : liveSetNumber;
+  const selectSet = (setNumber: number) => {
+    setPastSetSelection(
+      setNumber < liveSetNumber ? { matchId: match.id, setNumber } : null
+    );
+  };
   const activeSet = match.sets.find((s) => s.setNumber === activeSetNumber);
   const activeTarget = targetForSet(
     {
@@ -232,7 +233,13 @@ export function MatchConsole({
   }, [match.id, router]);
 
   async function runLifecycle(
-    fn: () => Promise<{ error?: string | null; success?: true } | undefined>
+    fn: () => Promise<
+      {
+        error?: string | null;
+        success?: true;
+        nextRevision?: number;
+      } | undefined
+    >
   ) {
     setBusy(true);
     const result = await fn();
@@ -241,7 +248,20 @@ export function MatchConsole({
       toast.error(result.error);
       return;
     }
+    if (result?.nextRevision != null) {
+      scoreRevisionRef.current = result.nextRevision;
+    }
     router.refresh();
+  }
+
+  function requestCorrection() {
+    const reason = window.prompt(
+      "Why is this match being reopened? This note will be saved in the score history."
+    );
+    if (!reason?.trim()) return;
+    void runLifecycle(() =>
+      reopenMatch(match.id, scoreRevisionRef.current, reason)
+    );
   }
 
   const winnerName =
@@ -341,7 +361,7 @@ export function MatchConsole({
                 variant="outline"
                 size="sm"
                 disabled={busy}
-                onClick={() => void runLifecycle(() => reopenMatch(match.id))}
+                onClick={requestCorrection}
               >
                 <RotateCcw className="h-4 w-4" />
                 Reopen for corrections
@@ -369,7 +389,11 @@ export function MatchConsole({
             </p>
             <Button
               disabled={busy || !hasTeams}
-              onClick={() => void runLifecycle(() => startMatch(match.id))}
+              onClick={() =>
+                void runLifecycle(() =>
+                  startMatch(match.id, scoreRevisionRef.current)
+                )
+              }
             >
               <Play className="h-4 w-4" />
               Resume match
@@ -381,7 +405,11 @@ export function MatchConsole({
           <CardContent className="flex flex-col gap-3 py-6 sm:flex-row sm:justify-center">
             <Button
               disabled={busy || !hasTeams}
-              onClick={() => void runLifecycle(() => startWarmup(match.id))}
+              onClick={() =>
+                void runLifecycle(() =>
+                  startWarmup(match.id, scoreRevisionRef.current)
+                )
+              }
             >
               <Timer className="h-4 w-4" />
               Start warmup
@@ -389,7 +417,11 @@ export function MatchConsole({
             <Button
               variant="outline"
               disabled={busy || !hasTeams}
-              onClick={() => void runLifecycle(() => startMatch(match.id))}
+              onClick={() =>
+                void runLifecycle(() =>
+                  startMatch(match.id, scoreRevisionRef.current)
+                )
+              }
             >
               <Play className="h-4 w-4" />
               Start match
@@ -406,7 +438,11 @@ export function MatchConsole({
             />
             <Button
               disabled={busy}
-              onClick={() => void runLifecycle(() => startMatch(match.id))}
+              onClick={() =>
+                void runLifecycle(() =>
+                  startMatch(match.id, scoreRevisionRef.current)
+                )
+              }
             >
               <Play className="h-4 w-4" />
               Start match
@@ -417,7 +453,7 @@ export function MatchConsole({
         // in_progress + canControl → scorekeeper
         <Card>
           <Scorekeeper
-            key={`${match.id}-${activeSetNumber}`}
+            key={`${match.id}-${activeSetNumber}-${match.scoreRevision}`}
             matchId={match.id}
             setNumber={activeSetNumber}
             liveSetNumber={liveSetNumber}
@@ -428,8 +464,10 @@ export function MatchConsole({
             teamBName={teamBName}
             sidesFlipped={sidesFlipped}
             onFlipSides={() => setSidesFlipped((f) => !f)}
-            onSelectSet={setSelectedSetNumber}
+            onSelectSet={selectSet}
             editingPastSet={editingPastSet}
+            initialRevision={match.scoreRevision}
+            onRevisionChange={handleScoreRevisionChange}
           />
           <CardContent className="space-y-4 pt-0">
             <Separator />
@@ -443,7 +481,11 @@ export function MatchConsole({
                   variant="outline"
                   size="sm"
                   disabled={busy}
-                  onClick={() => void runLifecycle(() => pauseMatch(match.id))}
+                  onClick={() =>
+                    void runLifecycle(() =>
+                      pauseMatch(match.id, scoreRevisionRef.current)
+                    )
+                  }
                 >
                   <Pause className="h-4 w-4" />
                   Pause match
@@ -455,7 +497,11 @@ export function MatchConsole({
                     disabled={busy}
                     onClick={() =>
                       void runLifecycle(() =>
-                        finalizeMatch(match.id, match.teamA!.id)
+                        finalizeMatch(
+                          match.id,
+                          match.teamA!.id,
+                          scoreRevisionRef.current
+                        )
                       )
                     }
                   >
@@ -469,7 +515,11 @@ export function MatchConsole({
                     disabled={busy}
                     onClick={() =>
                       void runLifecycle(() =>
-                        finalizeMatch(match.id, match.teamB!.id)
+                        finalizeMatch(
+                          match.id,
+                          match.teamB!.id,
+                          scoreRevisionRef.current
+                        )
                       )
                     }
                   >
@@ -482,7 +532,13 @@ export function MatchConsole({
                     size="sm"
                     disabled={busy}
                     onClick={() =>
-                      void runLifecycle(() => finalizeMatch(match.id, null))
+                      void runLifecycle(() =>
+                        finalizeMatch(
+                          match.id,
+                          null,
+                          scoreRevisionRef.current
+                        )
+                      )
                     }
                   >
                     Record tie
@@ -557,7 +613,7 @@ export function MatchConsole({
                 key={entry.setNumber}
                 type="button"
                 disabled={!selectable}
-                onClick={() => setSelectedSetNumber(entry.setNumber)}
+                onClick={() => selectSet(entry.setNumber)}
                 className={cn(
                   "flex w-full items-center justify-between rounded-md px-3 py-1.5 text-left text-sm transition-colors",
                   selected
@@ -627,6 +683,8 @@ function Scorekeeper({
   onFlipSides,
   onSelectSet,
   editingPastSet,
+  initialRevision,
+  onRevisionChange,
 }: {
   matchId: string;
   setNumber: number;
@@ -640,13 +698,22 @@ function Scorekeeper({
   onFlipSides: () => void;
   onSelectSet: (setNumber: number) => void;
   editingPastSet: boolean;
+  initialRevision: number;
+  onRevisionChange: (revision: number) => void;
 }) {
   const router = useRouter();
   const [a, setA] = useState(initialA);
   const [b, setB] = useState(initialB);
   const [saving, setSaving] = useState(false);
   const dirtyRef = useRef(false);
+  const revisionRef = useRef(initialRevision);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (!dirtyRef.current) {
+      revisionRef.current = initialRevision;
+    }
+  }, [initialRevision]);
 
   useEffect(() => {
     if (!dirtyRef.current) return;
@@ -659,12 +726,23 @@ function Scorekeeper({
         fd.set("setNumber", String(setNumber));
         fd.set("teamAScore", String(a));
         fd.set("teamBScore", String(b));
+        fd.set("expectedRevision", String(revisionRef.current));
         const result = await saveSetScore(fd);
         setSaving(false);
         if (result?.error) {
           toast.error(result.error);
+          dirtyRef.current = false;
+          router.refresh();
           return;
         }
+        if (result?.nextRevision == null) {
+          toast.error("Could not confirm the saved score. Refresh and try again.");
+          dirtyRef.current = false;
+          router.refresh();
+          return;
+        }
+        revisionRef.current = result.nextRevision;
+        onRevisionChange(result.nextRevision);
         dirtyRef.current = false;
         router.refresh();
       })();
@@ -672,7 +750,14 @@ function Scorekeeper({
     return () => {
       if (timer.current) clearTimeout(timer.current);
     };
-  }, [a, b, matchId, setNumber, router]);
+  }, [
+    a,
+    b,
+    matchId,
+    onRevisionChange,
+    router,
+    setNumber,
+  ]);
 
   function bump(team: "a" | "b", delta: number) {
     if (saving) return;

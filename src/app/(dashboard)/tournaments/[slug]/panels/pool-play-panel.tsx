@@ -20,7 +20,7 @@ import { LayoutGrid, Users } from "lucide-react";
 import type { InferSelectModel } from "drizzle-orm";
 import { and, count, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { divisions, registrations, tournaments } from "@/lib/db/schema";
+import { registrations, tournaments } from "@/lib/db/schema";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -29,7 +29,6 @@ import {
   poolAssignmentBlockedMessage,
   type UserForPermissions,
 } from "@/lib/tournaments/permissions";
-import { ensureDivisionBracketSkeleton } from "@/lib/tournaments/bracket-structure";
 import { getDivisionPlayData } from "../brackets/data";
 import { DivisionPoolRelease } from "../brackets/division-pool-release";
 import { PoolMatchFormatPanel } from "../brackets/pool-match-format-panel";
@@ -52,28 +51,18 @@ export async function TournamentPoolPlayPanel({
 }) {
   const isOrganizer = await resolveIsTournamentOrganizer(tournament, user);
 
-  const [divisionPlayData, pendingCountRow, tournamentDivisions] =
-    await Promise.all([
-      getDivisionPlayData(tournament.id, { forOrganizer: isOrganizer }),
-      db
-        .select({ value: count() })
-        .from(registrations)
-        .where(
-          and(
-            eq(registrations.tournamentId, tournament.id),
-            eq(registrations.status, "pending")
-          )
-        ),
-      isOrganizer
-        ? db
-            .select({
-              id: divisions.id,
-              format: divisions.format,
-            })
-            .from(divisions)
-            .where(eq(divisions.tournamentId, tournament.id))
-        : Promise.resolve([]),
-    ]);
+  const [divisionPlayData, pendingCountRow] = await Promise.all([
+    getDivisionPlayData(tournament.id, { forOrganizer: isOrganizer }),
+    db
+      .select({ value: count() })
+      .from(registrations)
+      .where(
+        and(
+          eq(registrations.tournamentId, tournament.id),
+          eq(registrations.status, "pending")
+        )
+      ),
+  ]);
 
   const pendingCount = pendingCountRow[0]?.value ?? 0;
   const canAssignPools = await canAssignTeamsToPools(
@@ -82,16 +71,6 @@ export async function TournamentPoolPlayPanel({
     pendingCount
   );
   const poolAssignmentBlocked = poolAssignmentBlockedMessage(pendingCount);
-
-  if (isOrganizer && tournamentDivisions.length > 0) {
-    const divsWithBracket = new Set(
-      divisionPlayData.filter((d) => d.brackets.length > 0).map((d) => d.id)
-    );
-    for (const div of tournamentDivisions) {
-      if (divsWithBracket.has(div.id)) continue;
-      await ensureDivisionBracketSkeleton(div.id, div.format);
-    }
-  }
 
   const poolMatchesStartedByPoolId = new Map<string, boolean>();
   if (isOrganizer) {

@@ -28,8 +28,11 @@ import {
   boolean,
   uniqueIndex,
   jsonb,
+  foreignKey,
+  index,
+  check,
 } from "drizzle-orm/pg-core";
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 
 export const userRoleEnum = pgEnum("user_role", [
   "player",
@@ -373,26 +376,32 @@ export const tournaments = pgTable("tournaments", {
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
-export const divisions = pgTable("divisions", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  tournamentId: uuid("tournament_id")
-    .references(() => tournaments.id, { onDelete: "cascade" })
-    .notNull(),
-  name: text("name").notNull(),
-  format: divisionFormatEnum("format").default("pool_to_bracket").notNull(),
-  /**
-   * Elimination brackets after pool play: 1 = gold only, 2 = gold + silver,
-   * 3 = gold + silver + bronze.
-   */
-  bracketCount: integer("bracket_count").default(1).notNull(),
-  /** Teams that advance into the gold bracket (pool_to_bracket). */
-  goldTeamCount: integer("gold_team_count"),
-  /** Teams that advance into silver when bracketCount is 3; remainder to bronze. */
-  silverTeamCount: integer("silver_team_count"),
-  /** When set, non-host users can view pool play and brackets for this pool. */
-  poolsReleasedAt: timestamp("pools_released_at", { withTimezone: true }),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
-});
+export const divisions = pgTable(
+  "divisions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tournamentId: uuid("tournament_id")
+      .references(() => tournaments.id, { onDelete: "cascade" })
+      .notNull(),
+    name: text("name").notNull(),
+    format: divisionFormatEnum("format").default("pool_to_bracket").notNull(),
+    /**
+     * Elimination brackets after pool play: 1 = gold only, 2 = gold + silver,
+     * 3 = gold + silver + bronze.
+     */
+    bracketCount: integer("bracket_count").default(1).notNull(),
+    /** Teams that advance into the gold bracket (pool_to_bracket). */
+    goldTeamCount: integer("gold_team_count"),
+    /** Teams that advance into silver when bracketCount is 3; remainder to bronze. */
+    silverTeamCount: integer("silver_team_count"),
+    /** When set, non-host users can view pool play and brackets for this pool. */
+    poolsReleasedAt: timestamp("pools_released_at", { withTimezone: true }),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex("divisions_id_tournament_unique").on(t.id, t.tournamentId),
+  ]
+);
 
 export const registrations = pgTable(
   "registrations",
@@ -405,10 +414,9 @@ export const registrations = pgTable(
       .references(() => tournaments.id, { onDelete: "cascade" })
       .notNull(),
     /** Set by tournament organizer when placing teams into divisions / pools */
-    divisionId: uuid("division_id").references(() => divisions.id, {
-      onDelete: "cascade",
-    }),
+    divisionId: uuid("division_id"),
     status: registrationStatusEnum("status").default("pending").notNull(),
+    revision: integer("revision").default(0).notNull(),
     registeredAt: timestamp("registered_at").defaultNow().notNull(),
   },
   (t) => [
@@ -416,44 +424,164 @@ export const registrations = pgTable(
       t.teamId,
       t.tournamentId
     ),
+    foreignKey({
+      name: "registrations_division_tournament_fk",
+      columns: [t.divisionId, t.tournamentId],
+      foreignColumns: [divisions.id, divisions.tournamentId],
+    }).onDelete("restrict"),
+    index("registrations_division_tournament_idx").on(
+      t.divisionId,
+      t.tournamentId
+    ),
+    check("registrations_revision_nonnegative", sql`${t.revision} >= 0`),
   ]
 );
 
-export const registrationPayments = pgTable("registration_payments", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  registrationId: uuid("registration_id")
-    .references(() => registrations.id, { onDelete: "cascade" })
-    .notNull()
-    .unique(),
-  tournamentId: uuid("tournament_id")
-    .references(() => tournaments.id, { onDelete: "cascade" })
-    .notNull(),
-  teamId: uuid("team_id")
-    .references(() => teams.id, { onDelete: "cascade" })
-    .notNull(),
-  amountCents: integer("amount_cents").notNull(),
-  status: registrationPaymentStatusEnum("status").default("unpaid").notNull(),
-  submittedMethod: registrationPaymentMethodEnum("submitted_method"),
-  submittedNote: text("submitted_note"),
-  submittedByUserId: uuid("submitted_by_user_id").references(() => users.id, {
-    onDelete: "set null",
-  }),
-  submittedAt: timestamp("submitted_at", { withTimezone: true }),
-  confirmedByUserId: uuid("confirmed_by_user_id").references(() => users.id, {
-    onDelete: "set null",
-  }),
-  confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
-  waivedByUserId: uuid("waived_by_user_id").references(() => users.id, {
-    onDelete: "set null",
-  }),
-  waivedAt: timestamp("waived_at", { withTimezone: true }),
-  createdAt: timestamp("created_at", { withTimezone: true })
-    .defaultNow()
-    .notNull(),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .defaultNow()
-    .notNull(),
-});
+export const registrationPayments = pgTable(
+  "registration_payments",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    registrationId: uuid("registration_id")
+      .references(() => registrations.id, { onDelete: "cascade" })
+      .notNull()
+      .unique(),
+    tournamentId: uuid("tournament_id")
+      .references(() => tournaments.id, { onDelete: "cascade" })
+      .notNull(),
+    teamId: uuid("team_id")
+      .references(() => teams.id, { onDelete: "cascade" })
+      .notNull(),
+    amountCents: integer("amount_cents").notNull(),
+    status: registrationPaymentStatusEnum("status").default("unpaid").notNull(),
+    submittedMethod: registrationPaymentMethodEnum("submitted_method"),
+    submittedNote: text("submitted_note"),
+    submittedByUserId: uuid("submitted_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    submittedAt: timestamp("submitted_at", { withTimezone: true }),
+    confirmedByUserId: uuid("confirmed_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
+    waivedByUserId: uuid("waived_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    waivedAt: timestamp("waived_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    check(
+      "registration_payments_amount_nonnegative",
+      sql`${t.amountCents} >= 0`
+    ),
+    check(
+      "registration_payments_terminal_metadata_consistent",
+      sql`
+        NOT (${t.confirmedAt} IS NOT NULL AND ${t.waivedAt} IS NOT NULL)
+        AND (
+          ${t.status} <> 'confirmed'
+          OR ${t.confirmedAt} IS NOT NULL
+        )
+        AND (
+          ${t.status} <> 'waived'
+          OR ${t.waivedAt} IS NOT NULL
+        )
+        AND (
+          ${t.status} <> 'submitted'
+          OR (
+            ${t.submittedMethod} IS NOT NULL
+            AND ${t.submittedAt} IS NOT NULL
+          )
+        )
+      `
+    ),
+  ]
+);
+
+export const registrationStatusEvents = pgTable(
+  "registration_status_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    registrationId: uuid("registration_id").references(
+      () => registrations.id,
+      { onDelete: "set null" }
+    ),
+    tournamentId: uuid("tournament_id")
+      .references(() => tournaments.id, { onDelete: "cascade" })
+      .notNull(),
+    teamId: uuid("team_id")
+      .references(() => teams.id, { onDelete: "cascade" })
+      .notNull(),
+    fromStatus: registrationStatusEnum("from_status"),
+    toStatus: registrationStatusEnum("to_status").notNull(),
+    actorUserId: uuid("actor_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    operationId: uuid("operation_id").notNull(),
+    reason: text("reason"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    uniqueIndex("registration_status_events_team_operation_unique").on(
+      t.tournamentId,
+      t.teamId,
+      t.operationId
+    ),
+    index("registration_status_events_tournament_id_idx").on(t.tournamentId),
+    index("registration_status_events_registration_id_idx").on(
+      t.registrationId
+    ),
+    index("registration_status_events_team_id_idx").on(t.teamId),
+    index("registration_status_events_actor_user_id_idx").on(t.actorUserId),
+    index("registration_status_events_operation_id_idx").on(t.operationId),
+  ]
+);
+
+export const registrationPaymentEvents = pgTable(
+  "registration_payment_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    paymentId: uuid("payment_id").references(
+      () => registrationPayments.id,
+      { onDelete: "set null" }
+    ),
+    registrationId: uuid("registration_id").references(
+      () => registrations.id,
+      { onDelete: "set null" }
+    ),
+    tournamentId: uuid("tournament_id")
+      .references(() => tournaments.id, { onDelete: "cascade" })
+      .notNull(),
+    actorUserId: uuid("actor_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    fromStatus: registrationPaymentStatusEnum("from_status").notNull(),
+    toStatus: registrationPaymentStatusEnum("to_status").notNull(),
+    operationId: uuid("operation_id").notNull(),
+    metadata: jsonb("metadata").$type<Record<string, unknown>>(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    uniqueIndex("registration_payment_events_operation_unique").on(
+      t.operationId
+    ),
+    index("registration_payment_events_payment_id_idx").on(t.paymentId),
+    index("registration_payment_events_registration_id_idx").on(
+      t.registrationId
+    ),
+    index("registration_payment_events_tournament_id_idx").on(t.tournamentId),
+    index("registration_payment_events_actor_user_id_idx").on(t.actorUserId),
+  ]
+);
 
 export const tournamentWaivers = pgTable(
   "tournament_waivers",
@@ -607,16 +735,22 @@ export const pools = pgTable("pools", {
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
-export const poolTeams = pgTable("pool_teams", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  poolId: uuid("pool_id")
-    .references(() => pools.id, { onDelete: "cascade" })
-    .notNull(),
-  teamId: uuid("team_id")
-    .references(() => teams.id, { onDelete: "cascade" })
-    .notNull(),
-  seed: integer("seed"),
-});
+export const poolTeams = pgTable(
+  "pool_teams",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    poolId: uuid("pool_id")
+      .references(() => pools.id, { onDelete: "cascade" })
+      .notNull(),
+    teamId: uuid("team_id")
+      .references(() => teams.id, { onDelete: "cascade" })
+      .notNull(),
+    seed: integer("seed"),
+  },
+  (t) => [
+    uniqueIndex("pool_teams_pool_team_unique").on(t.poolId, t.teamId),
+  ]
+);
 
 export const brackets = pgTable("brackets", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -692,11 +826,21 @@ export const matches = pgTable(
      * planned start). */
     startedAt: timestamp("started_at"),
     winnerId: uuid("winner_id").references(() => teams.id),
+    scoreRevision: integer("score_revision").default(0).notNull(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
   },
   (t) => [
     uniqueIndex("matches_tournament_slug_unique").on(t.tournamentId, t.slug),
+    uniqueIndex("matches_bracket_coordinate_unique")
+      .on(t.bracketId, t.bracketRound, t.bracketPosition)
+      .where(
+        sql`${t.bracketId} IS NOT NULL AND ${t.bracketRound} IS NOT NULL AND ${t.bracketPosition} IS NOT NULL`
+      ),
+    check(
+      "matches_score_revision_nonnegative",
+      sql`${t.scoreRevision} >= 0`
+    ),
   ]
 );
 
@@ -713,6 +857,47 @@ export const sets = pgTable(
   },
   (t) => [
     uniqueIndex("sets_match_set_number_unique").on(t.matchId, t.setNumber),
+  ]
+);
+
+export const matchScoreEvents = pgTable(
+  "match_score_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    matchId: uuid("match_id")
+      .references(() => matches.id, { onDelete: "cascade" })
+      .notNull(),
+    revision: integer("revision").notNull(),
+    actorUserId: uuid("actor_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    eventType: text("event_type").notNull(),
+    setNumber: integer("set_number"),
+    previousValue: jsonb("previous_value").$type<Record<string, unknown>>(),
+    newValue: jsonb("new_value").$type<Record<string, unknown>>(),
+    correctionReason: text("correction_reason"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    uniqueIndex("match_score_events_match_revision_unique").on(
+      t.matchId,
+      t.revision
+    ),
+    index("match_score_events_actor_user_id_idx").on(t.actorUserId),
+    check(
+      "match_score_events_revision_positive",
+      sql`${t.revision} > 0`
+    ),
+    check(
+      "match_score_events_correction_reason_length",
+      sql`${t.correctionReason} IS NULL OR char_length(${t.correctionReason}) <= 500`
+    ),
+    check(
+      "match_score_events_event_type_check",
+      sql`${t.eventType} IN ('set_score_saved', 'match_finalized', 'match_reopened', 'downstream_invalidated', 'warmup_started', 'match_started', 'match_paused')`
+    ),
   ]
 );
 
@@ -913,28 +1098,32 @@ export const divisionsRelations = relations(divisions, ({ one, many }) => ({
   courtDivisions: many(courtDivisions),
 }));
 
-export const registrationsRelations = relations(registrations, ({ one }) => ({
-  team: one(teams, {
-    fields: [registrations.teamId],
-    references: [teams.id],
-  }),
-  tournament: one(tournaments, {
-    fields: [registrations.tournamentId],
-    references: [tournaments.id],
-  }),
-  division: one(divisions, {
-    fields: [registrations.divisionId],
-    references: [divisions.id],
-  }),
-  payment: one(registrationPayments, {
-    fields: [registrations.id],
-    references: [registrationPayments.registrationId],
-  }),
-}));
+export const registrationsRelations = relations(
+  registrations,
+  ({ one, many }) => ({
+    team: one(teams, {
+      fields: [registrations.teamId],
+      references: [teams.id],
+    }),
+    tournament: one(tournaments, {
+      fields: [registrations.tournamentId],
+      references: [tournaments.id],
+    }),
+    division: one(divisions, {
+      fields: [registrations.divisionId],
+      references: [divisions.id],
+    }),
+    payment: one(registrationPayments, {
+      fields: [registrations.id],
+      references: [registrationPayments.registrationId],
+    }),
+    statusEvents: many(registrationStatusEvents),
+  })
+);
 
 export const registrationPaymentsRelations = relations(
   registrationPayments,
-  ({ one }) => ({
+  ({ one, many }) => ({
     registration: one(registrations, {
       fields: [registrationPayments.registrationId],
       references: [registrations.id],
@@ -961,6 +1150,51 @@ export const registrationPaymentsRelations = relations(
       fields: [registrationPayments.waivedByUserId],
       references: [users.id],
       relationName: "paymentWaivedBy",
+    }),
+    events: many(registrationPaymentEvents),
+  })
+);
+
+export const registrationStatusEventsRelations = relations(
+  registrationStatusEvents,
+  ({ one }) => ({
+    registration: one(registrations, {
+      fields: [registrationStatusEvents.registrationId],
+      references: [registrations.id],
+    }),
+    tournament: one(tournaments, {
+      fields: [registrationStatusEvents.tournamentId],
+      references: [tournaments.id],
+    }),
+    team: one(teams, {
+      fields: [registrationStatusEvents.teamId],
+      references: [teams.id],
+    }),
+    actor: one(users, {
+      fields: [registrationStatusEvents.actorUserId],
+      references: [users.id],
+    }),
+  })
+);
+
+export const registrationPaymentEventsRelations = relations(
+  registrationPaymentEvents,
+  ({ one }) => ({
+    payment: one(registrationPayments, {
+      fields: [registrationPaymentEvents.paymentId],
+      references: [registrationPayments.id],
+    }),
+    registration: one(registrations, {
+      fields: [registrationPaymentEvents.registrationId],
+      references: [registrations.id],
+    }),
+    tournament: one(tournaments, {
+      fields: [registrationPaymentEvents.tournamentId],
+      references: [tournaments.id],
+    }),
+    actor: one(users, {
+      fields: [registrationPaymentEvents.actorUserId],
+      references: [users.id],
     }),
   })
 );
@@ -1034,8 +1268,23 @@ export const matchesRelations = relations(matches, ({ one, many }) => ({
     relationName: "winner",
   }),
   sets: many(sets),
+  scoreEvents: many(matchScoreEvents),
 }));
 
 export const setsRelations = relations(sets, ({ one }) => ({
   match: one(matches, { fields: [sets.matchId], references: [matches.id] }),
 }));
+
+export const matchScoreEventsRelations = relations(
+  matchScoreEvents,
+  ({ one }) => ({
+    match: one(matches, {
+      fields: [matchScoreEvents.matchId],
+      references: [matches.id],
+    }),
+    actor: one(users, {
+      fields: [matchScoreEvents.actorUserId],
+      references: [users.id],
+    }),
+  })
+);

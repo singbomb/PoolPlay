@@ -193,10 +193,33 @@ export async function adminUpdateTournamentStatus(
 }
 
 export async function adminDeleteTournament(tournamentId: string) {
-  await requireAdmin();
+  const admin = await requireAdmin();
 
   try {
     await db.transaction(async (tx) => {
+      const [lockedTournament] = await tx
+        .select({ id: tournaments.id })
+        .from(tournaments)
+        .where(eq(tournaments.id, tournamentId))
+        .for("update")
+        .limit(1);
+      if (!lockedTournament) {
+        throw new Error("Tournament not found");
+      }
+      const [currentAdmin] = await tx
+        .select({ role: users.role, disabledAt: users.disabledAt })
+        .from(users)
+        .where(eq(users.id, admin.id))
+        .for("share")
+        .limit(1);
+      if (
+        !currentAdmin ||
+        currentAdmin.disabledAt != null ||
+        currentAdmin.role !== "admin"
+      ) {
+        throw new Error("Admin access changed");
+      }
+
       const poolRows = await tx
         .select({ id: pools.id })
         .from(pools)

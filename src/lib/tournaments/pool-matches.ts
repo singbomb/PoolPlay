@@ -16,9 +16,16 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { asc, eq, inArray } from "drizzle-orm";
+import { asc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { divisions, matches, poolTeams, pools, teams } from "@/lib/db/schema";
+import {
+  divisions,
+  matches,
+  poolTeams,
+  pools,
+  teams,
+  tournaments,
+} from "@/lib/db/schema";
 import { assignRefsToMatchups, generatePoolMatches } from "@/lib/utils/pool";
 import {
   getTakenMatchSlugsInTournament,
@@ -34,10 +41,36 @@ type DbClient = typeof db;
  * Rebuild round-robin pool matches from the current seed order. Only allowed
  * when every existing pool match is still upcoming.
  */
-export async function regeneratePoolMatchesFromSeeds(
+export async function regeneratePoolMatchesFromSeedsInTransaction(
   poolId: string,
-  client: DbClient = db
+  client: DbClient
 ): Promise<{ error?: string; matchCount?: number }> {
+  const [identity] = await client
+    .select({ tournamentId: divisions.tournamentId })
+    .from(pools)
+    .innerJoin(divisions, eq(pools.divisionId, divisions.id))
+    .where(eq(pools.id, poolId))
+    .limit(1);
+  if (!identity) return { error: "Pool not found" };
+  await client.execute(sql`
+    SELECT id
+    FROM ${tournaments}
+    WHERE ${tournaments.id} = ${identity.tournamentId}
+    FOR UPDATE
+  `);
+  const [lockedIdentity] = await client
+    .select({ tournamentId: divisions.tournamentId })
+    .from(pools)
+    .innerJoin(divisions, eq(pools.divisionId, divisions.id))
+    .where(eq(pools.id, poolId))
+    .limit(1);
+  if (
+    !lockedIdentity ||
+    lockedIdentity.tournamentId !== identity.tournamentId
+  ) {
+    return { error: "Pool changed while seeding was being updated" };
+  }
+
   const members = await client
     .select({ teamId: poolTeams.teamId, seed: poolTeams.seed })
     .from(poolTeams)
@@ -65,20 +98,6 @@ export async function regeneratePoolMatchesFromSeeds(
     await client.delete(matches).where(eq(matches.poolId, poolId));
   }
 
-  const [poolRow] = await client
-    .select({ divisionId: pools.divisionId })
-    .from(pools)
-    .where(eq(pools.id, poolId))
-    .limit(1);
-  if (!poolRow) return { error: "Pool not found" };
-
-  const [division] = await client
-    .select({ tournamentId: divisions.tournamentId })
-    .from(divisions)
-    .where(eq(divisions.id, poolRow.divisionId))
-    .limit(1);
-  if (!division) return { error: "Division not found" };
-
   const teamIds = members.map((m) => m.teamId);
   const teamSlugRows =
     teamIds.length > 0
@@ -90,7 +109,7 @@ export async function regeneratePoolMatchesFromSeeds(
   const slugByTeamId = new Map(teamSlugRows.map((t) => [t.id, t.slug]));
 
   const taken = await getTakenMatchSlugsInTournament(
-    division.tournamentId,
+    identity.tournamentId,
     [],
     client
   );
@@ -107,7 +126,7 @@ export async function regeneratePoolMatchesFromSeeds(
     const slug = reserveMatchSlug(base, taken);
 
     await client.insert(matches).values({
-      tournamentId: division.tournamentId,
+      tournamentId: identity.tournamentId,
       slug,
       poolId,
       teamAId: matchup.teamAId,
@@ -118,6 +137,17 @@ export async function regeneratePoolMatchesFromSeeds(
   }
 
   return { matchCount: matchups.length };
+}
+
+export async function regeneratePoolMatchesFromSeeds(
+  poolId: string
+): Promise<{ error?: string; matchCount?: number }> {
+  return db.transaction((tx) =>
+    regeneratePoolMatchesFromSeedsInTransaction(
+      poolId,
+      tx as unknown as DbClient
+    )
+  );
 }
 
 /** True when every pool match is completed (or there are none). */

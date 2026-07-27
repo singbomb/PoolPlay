@@ -197,7 +197,7 @@ export default async function ScoringPage({ params }: Props) {
             <div className="grid gap-4 md:grid-cols-2">
               {inProgress.map((match) => (
                 <ScoringCard
-                  key={match.id}
+                  key={`${match.id}-${match.scoreRevision}`}
                   match={match}
                   canScore={canScore}
                   matchFormat={tournament.matchFormat}
@@ -222,7 +222,7 @@ export default async function ScoringPage({ params }: Props) {
             <div className="grid gap-4 md:grid-cols-2">
               {upcoming.map((match) => (
                 <ScoringCard
-                  key={match.id}
+                  key={`${match.id}-${match.scoreRevision}`}
                   match={match}
                   canScore={canScore}
                   matchFormat={tournament.matchFormat}
@@ -247,7 +247,7 @@ export default async function ScoringPage({ params }: Props) {
             <div className="grid gap-4 md:grid-cols-2">
               {completed.map((match) => (
                 <ScoringCard
-                  key={match.id}
+                  key={`${match.id}-${match.scoreRevision}`}
                   match={match}
                   canScore={canScore}
                   matchFormat={tournament.matchFormat}

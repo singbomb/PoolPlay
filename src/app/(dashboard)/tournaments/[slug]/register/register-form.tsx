@@ -47,6 +47,11 @@ type TeamGroup = {
   teams: RegisterTeam[];
 };
 
+type RegistrationOperation = {
+  selectionKey: string;
+  operationId: string;
+};
+
 interface Props {
   tournamentId: string;
   tournamentSlug: string;
@@ -92,6 +97,15 @@ function groupTeamsBySchool(teams: RegisterTeam[]): TeamGroup[] {
     });
   }
   return groups;
+}
+
+function registrationOperationForSelection(
+  current: RegistrationOperation | null,
+  teamIds: Iterable<string>
+): RegistrationOperation {
+  const selectionKey = [...teamIds].sort().join(",");
+  if (current?.selectionKey === selectionKey) return current;
+  return { selectionKey, operationId: crypto.randomUUID() };
 }
 
 function useDismissOnOutsideClick(
@@ -149,6 +163,7 @@ function HostRegisterForm({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const registrationOperationRef = useRef<RegistrationOperation | null>(null);
 
   const selectedSchool = schools.find((s) => s.id === selectedSchoolId) ?? null;
 
@@ -261,12 +276,30 @@ function HostRegisterForm({
 
     setLoading(true);
     setSubmitError(null);
-    const result = await registerTeams(tournamentId, [...selectedIds]);
-    if (result?.error) {
-      setSubmitError(result.error);
+    const operation = registrationOperationForSelection(
+      registrationOperationRef.current,
+      selectedIds
+    );
+    registrationOperationRef.current = operation;
+
+    try {
+      const result = await registerTeams(
+        tournamentId,
+        [...selectedIds],
+        operation.operationId
+      );
+      if (result?.error) {
+        setSubmitError(result.error);
+        setLoading(false);
+      } else {
+        registrationOperationRef.current = null;
+        router.push(`/tournaments/${tournamentSlug}`);
+      }
+    } catch {
+      setSubmitError(
+        "Could not confirm whether registration completed. Try again to safely retry."
+      );
       setLoading(false);
-    } else {
-      router.push(`/tournaments/${tournamentSlug}`);
     }
   }
 
@@ -520,6 +553,7 @@ function CaptainRegisterForm({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const registrationOperationRef = useRef<RegistrationOperation | null>(null);
 
   const allSelected =
     teams.length > 0 && teams.every((t) => selectedIds.has(t.id));
@@ -568,12 +602,30 @@ function CaptainRegisterForm({
 
     setLoading(true);
     setError(null);
-    const result = await registerTeams(tournamentId, [...selectedIds]);
-    if (result?.error) {
-      setError(result.error);
+    const operation = registrationOperationForSelection(
+      registrationOperationRef.current,
+      selectedIds
+    );
+    registrationOperationRef.current = operation;
+
+    try {
+      const result = await registerTeams(
+        tournamentId,
+        [...selectedIds],
+        operation.operationId
+      );
+      if (result?.error) {
+        setError(result.error);
+        setLoading(false);
+      } else {
+        registrationOperationRef.current = null;
+        router.push(`/tournaments/${tournamentSlug}`);
+      }
+    } catch {
+      setError(
+        "Could not confirm whether registration completed. Try again to safely retry."
+      );
       setLoading(false);
-    } else {
-      router.push(`/tournaments/${tournamentSlug}`);
     }
   }
 

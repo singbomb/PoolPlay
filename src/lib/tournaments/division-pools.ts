@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
   divisions,
@@ -53,6 +53,20 @@ export async function ensureDivisionAutoPool(
   divisionId: string,
   client: DbClient = db
 ): Promise<string | null> {
+  if (client === db) {
+    return db.transaction((tx) =>
+      ensureDivisionAutoPool(
+        divisionId,
+        tx as unknown as DbClient
+      )
+    );
+  }
+
+  await client.execute(sql`
+    SELECT pg_advisory_xact_lock(
+      hashtextextended(${`poolplay:auto-pool:${divisionId}`}, 0)
+    )
+  `);
   const existing = await client
     .select({ id: pools.id })
     .from(pools)
@@ -88,6 +102,17 @@ export async function syncDivisionAutoPoolMembers(
   divisionId: string,
   client: DbClient = db
 ): Promise<void> {
+  if (client === db) {
+    await db.transaction((tx) =>
+      syncDivisionAutoPoolMembers(
+        tournamentId,
+        divisionId,
+        tx as unknown as DbClient
+      )
+    );
+    return;
+  }
+
   const poolId = await ensureDivisionAutoPool(divisionId, client);
   if (!poolId) return;
 
@@ -139,11 +164,16 @@ export async function syncDivisionAutoPoolMembers(
   for (const teamId of desiredIds) {
     if (!currentByTeam.has(teamId)) {
       maxSeed += 1;
-      await client.insert(poolTeams).values({
-        poolId,
-        teamId,
-        seed: maxSeed,
-      });
+      await client
+        .insert(poolTeams)
+        .values({
+          poolId,
+          teamId,
+          seed: maxSeed,
+        })
+        .onConflictDoNothing({
+          target: [poolTeams.poolId, poolTeams.teamId],
+        });
     }
   }
 }
@@ -161,7 +191,7 @@ export async function syncManyDivisionPools(
   for (const id of divisionIds) {
     if (id) ids.add(id);
   }
-  for (const id of ids) {
+  for (const id of [...ids].sort()) {
     await syncDivisionAutoPoolMembers(tournamentId, id, client);
   }
 }

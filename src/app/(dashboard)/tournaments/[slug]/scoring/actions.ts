@@ -20,17 +20,32 @@
 
 import { revalidatePath } from "next/cache";
 import { db } from "@/lib/db";
-import { matches, pools, sets, tournaments } from "@/lib/db/schema";
-import { asc, eq, and, ne } from "drizzle-orm";
+import { tournaments } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
 import { requireUser } from "@/lib/auth";
 import { updateScoreSchema } from "@/lib/validators";
 import { canScoreMatches } from "@/lib/tournaments/permissions";
 import { getMatchTournamentId } from "@/lib/tournaments/match-query";
 import {
-  upsertSetScore,
-  completeMatchAndRunSideEffects,
+  finalizeMatchTransactional,
+  saveSetScoreTransactional,
 } from "@/lib/tournaments/match-finalize";
-import { evaluateMatchOutcome } from "@/lib/tournaments/match-format";
+import {
+  OperationConflictError,
+  OperationValidationError,
+} from "@/lib/tournaments/competition-operation-rules";
+import { transitionMatchLifecycleTransactional } from "@/lib/tournaments/score-operation-support";
+
+function competitionOperationError(error: unknown): string {
+  if (
+    error instanceof OperationConflictError ||
+    error instanceof OperationValidationError
+  ) {
+    return error.message;
+  }
+  console.error("Competition operation failed", error);
+  return "Could not save this match. Try again.";
+}
 
 async function assertCanScoreMatch(matchId: string) {
   const user = await requireUser();
@@ -63,122 +78,88 @@ export async function updateScore(formData: FormData) {
     setNumber: parseInt(formData.get("setNumber") as string, 10),
     teamAScore: parseInt(formData.get("teamAScore") as string, 10),
     teamBScore: parseInt(formData.get("teamBScore") as string, 10),
+    expectedRevision: parseInt(
+      formData.get("expectedRevision") as string,
+      10
+    ),
   });
 
   if (!parsed.success) {
     return { error: parsed.error.issues[0].message };
   }
 
-  const { matchId, setNumber, teamAScore, teamBScore } = parsed.data;
-
-  const gate = await assertCanScoreMatch(matchId);
-  if (gate.error) return { error: gate.error };
-
-  await upsertSetScore(matchId, setNumber, teamAScore, teamBScore);
-
-  const [match] = await db
-    .select()
-    .from(matches)
-    .where(eq(matches.id, matchId))
-    .limit(1);
-
-  if (match && match.status === "upcoming") {
-    await db
-      .update(matches)
-      .set({ status: "in_progress", updatedAt: new Date() })
-      .where(
-        and(eq(matches.id, matchId), ne(matches.status, "completed"))
-      );
-  }
-
-  // After saving this set, auto-finalize when the tournament's match format
-  // says enough sets have been played (e.g. 2-with-tiebreak, both sets split).
-  if (match && match.teamAId && match.teamBId && match.status !== "completed") {
-    const tournament = gate.tournament;
-    const allSets = await db
-      .select({
-        teamAScore: sets.teamAScore,
-        teamBScore: sets.teamBScore,
-      })
-      .from(sets)
-      .where(eq(sets.matchId, matchId))
-      .orderBy(asc(sets.setNumber));
-
-    const outcome = evaluateMatchOutcome(
-      { format: tournament.matchFormat },
-      match.teamAId,
-      match.teamBId,
-      allSets
-    );
-
-    if (outcome.shouldFinalize) {
-      const [poolRow] = match.poolId
-        ? await db
-            .select({ divisionId: pools.divisionId })
-            .from(pools)
-            .where(eq(pools.id, match.poolId))
-            .limit(1)
-        : [];
-
-      const { newlyCompleted } = await completeMatchAndRunSideEffects({
-        matchId,
-        winnerId: outcome.winnerId,
-        tournamentId: tournament.id,
-        divisionId: poolRow?.divisionId,
-      });
-
-      if (newlyCompleted) {
-        revalidatePath("/tournaments/[slug]", "page");
-      }
-    }
-  }
-
-  revalidatePath(`/tournaments/[slug]/scoring`, "page");
-  return { success: true };
-}
-
-export async function finalizeMatch(matchId: string, winnerId: string) {
-  const gate = await assertCanScoreMatch(matchId);
-  if (gate.error) return { error: gate.error };
-
-  const [match] = await db
-    .select({
-      status: matches.status,
-      poolId: matches.poolId,
-      divisionId: pools.divisionId,
-    })
-    .from(matches)
-    .leftJoin(pools, eq(matches.poolId, pools.id))
-    .where(eq(matches.id, matchId))
-    .limit(1);
-
-  if (match?.status === "completed") {
-    return { success: true };
-  }
-
-  await completeMatchAndRunSideEffects({
+  const {
     matchId,
-    winnerId,
-    tournamentId: gate.tournament!.id,
-    divisionId: match?.divisionId,
-  });
+    setNumber,
+    teamAScore,
+    teamBScore,
+    expectedRevision,
+  } = parsed.data;
 
-  revalidatePath(`/tournaments/[slug]/scoring`, "page");
-  revalidatePath("/tournaments/[slug]", "page");
-  return { success: true };
+  const gate = await assertCanScoreMatch(matchId);
+  if (gate.error || !gate.user) return { error: gate.error };
+
+  try {
+    const result = await saveSetScoreTransactional({
+      matchId,
+      setNumber,
+      teamAScore,
+      teamBScore,
+      expectedRevision,
+      actorUserId: gate.user.id,
+    });
+
+    revalidatePath(`/tournaments/[slug]/scoring`, "page");
+    revalidatePath("/tournaments/[slug]", "page");
+    return {
+      success: true as const,
+      nextRevision: result.nextRevision,
+      newlyCompleted: result.newlyCompleted,
+    };
+  } catch (error) {
+    return { error: competitionOperationError(error) };
+  }
 }
 
-export async function startMatch(matchId: string) {
+export async function finalizeMatch(
+  matchId: string,
+  winnerId: string,
+  expectedRevision: number
+) {
   const gate = await assertCanScoreMatch(matchId);
-  if (gate.error) return { error: gate.error };
+  if (gate.error || !gate.user) return { error: gate.error };
 
-  await db
-    .update(matches)
-    .set({ status: "in_progress", updatedAt: new Date() })
-    .where(
-      and(eq(matches.id, matchId), ne(matches.status, "completed"))
-    );
+  try {
+    const result = await finalizeMatchTransactional({
+      matchId,
+      winnerId,
+      expectedRevision,
+      actorUserId: gate.user.id,
+    });
 
-  revalidatePath(`/tournaments/[slug]/scoring`, "page");
-  return { success: true };
+    revalidatePath(`/tournaments/[slug]/scoring`, "page");
+    revalidatePath("/tournaments/[slug]", "page");
+    return { success: true as const, nextRevision: result.nextRevision };
+  } catch (error) {
+    return { error: competitionOperationError(error) };
+  }
+}
+
+export async function startMatch(matchId: string, expectedRevision: number) {
+  const gate = await assertCanScoreMatch(matchId);
+  if (gate.error || !gate.user) return { error: gate.error };
+
+  try {
+    const result = await transitionMatchLifecycleTransactional({
+      matchId,
+      action: "start",
+      expectedRevision,
+      actorUserId: gate.user.id,
+    });
+    revalidatePath(`/tournaments/[slug]/scoring`, "page");
+    revalidatePath("/tournaments/[slug]", "page");
+    return { success: true as const, nextRevision: result.nextRevision };
+  } catch (error) {
+    return { error: competitionOperationError(error) };
+  }
 }
