@@ -99,6 +99,34 @@ export const bracketTypeEnum = pgEnum("bracket_type", [
   "double_elimination",
 ]);
 
+export const bracketSectionEnum = pgEnum("bracket_section", [
+  "main",
+  "winners",
+  "losers",
+  "grand_final",
+]);
+
+export const bracketActivationEnum = pgEnum("bracket_activation", [
+  "required",
+  "conditional",
+  "not_required",
+]);
+
+export const bracketOutcomeEnum = pgEnum("bracket_outcome", [
+  "winner",
+  "loser",
+]);
+
+export const bracketTargetSlotEnum = pgEnum("bracket_target_slot", [
+  "team_a",
+  "team_b",
+]);
+
+export const bracketFeedConditionEnum = pgEnum("bracket_feed_condition", [
+  "always",
+  "source_team_b_wins",
+]);
+
 export const matchStatusEnum = pgEnum("match_status", [
   "upcoming",
   "in_progress",
@@ -752,21 +780,32 @@ export const poolTeams = pgTable(
   ]
 );
 
-export const brackets = pgTable("brackets", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  divisionId: uuid("division_id")
-    .references(() => divisions.id, { onDelete: "cascade" })
-    .notNull(),
-  bracketType: bracketTypeEnum("bracket_type")
-    .default("single_elimination")
-    .notNull(),
-  seedCount: integer("seed_count").notNull(),
-  /** Display name, e.g. Gold / Silver / Bronze. */
-  name: text("name"),
-  /** 0 = Gold, 1 = Silver, 2 = Bronze. */
-  tier: integer("tier").default(0).notNull(),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
-});
+export const brackets = pgTable(
+  "brackets",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    divisionId: uuid("division_id")
+      .references(() => divisions.id, { onDelete: "cascade" })
+      .notNull(),
+    bracketType: bracketTypeEnum("bracket_type")
+      .default("single_elimination")
+      .notNull(),
+    seedCount: integer("seed_count").notNull(),
+    /** Display name, e.g. Gold / Silver / Bronze. */
+    name: text("name"),
+    /** 0 = Gold, 1 = Silver, 2 = Bronze. */
+    tier: integer("tier").default(0).notNull(),
+    /** Version of the persisted match-and-edge graph for safe regeneration. */
+    topologyVersion: integer("topology_version").default(1).notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (t) => [
+    check(
+      "brackets_topology_version_positive",
+      sql`${t.topologyVersion} > 0`
+    ),
+  ]
+);
 
 export const courts = pgTable("courts", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -802,7 +841,7 @@ export const matches = pgTable(
     slug: text("slug").notNull(),
     poolId: uuid("pool_id").references(() => pools.id, { onDelete: "set null" }),
     bracketId: uuid("bracket_id").references(() => brackets.id, {
-      onDelete: "set null",
+      onDelete: "cascade",
     }),
     courtId: uuid("court_id").references(() => courts.id, {
       onDelete: "set null",
@@ -814,6 +853,8 @@ export const matches = pgTable(
     refTeamId: uuid("ref_team_id").references(() => teams.id, {
       onDelete: "set null",
     }),
+    bracketSection: bracketSectionEnum("bracket_section"),
+    bracketActivation: bracketActivationEnum("bracket_activation"),
     bracketRound: integer("bracket_round"),
     bracketPosition: integer("bracket_position"),
     scheduledTime: timestamp("scheduled_time"),
@@ -832,14 +873,98 @@ export const matches = pgTable(
   },
   (t) => [
     uniqueIndex("matches_tournament_slug_unique").on(t.tournamentId, t.slug),
+    uniqueIndex("matches_id_bracket_unique").on(t.id, t.bracketId),
     uniqueIndex("matches_bracket_coordinate_unique")
-      .on(t.bracketId, t.bracketRound, t.bracketPosition)
+      .on(
+        t.bracketId,
+        t.bracketSection,
+        t.bracketRound,
+        t.bracketPosition
+      )
       .where(
-        sql`${t.bracketId} IS NOT NULL AND ${t.bracketRound} IS NOT NULL AND ${t.bracketPosition} IS NOT NULL`
+        sql`${t.bracketId} IS NOT NULL AND ${t.bracketSection} IS NOT NULL AND ${t.bracketRound} IS NOT NULL AND ${t.bracketPosition} IS NOT NULL`
       ),
+    check(
+      "matches_bracket_metadata_check",
+      sql`(
+        ${t.bracketId} IS NULL
+        AND ${t.bracketSection} IS NULL
+        AND ${t.bracketActivation} IS NULL
+        AND ${t.bracketRound} IS NULL
+        AND ${t.bracketPosition} IS NULL
+      ) OR (
+        ${t.bracketId} IS NOT NULL
+        AND ${t.poolId} IS NULL
+        AND ${t.bracketSection} IS NOT NULL
+        AND ${t.bracketActivation} IS NOT NULL
+        AND ${t.bracketRound} IS NOT NULL
+        AND ${t.bracketPosition} IS NOT NULL
+        AND ${t.bracketRound} > 0
+        AND ${t.bracketPosition} > 0
+      )`
+    ),
+    check(
+      "matches_distinct_participants_check",
+      sql`${t.teamAId} IS NULL OR ${t.teamBId} IS NULL OR ${t.teamAId} <> ${t.teamBId}`
+    ),
+    check(
+      "matches_winner_is_participant_check",
+      sql`${t.winnerId} IS NULL OR coalesce(${t.winnerId} = ${t.teamAId}, false) OR coalesce(${t.winnerId} = ${t.teamBId}, false)`
+    ),
+    check(
+      "matches_completed_bracket_winner_check",
+      sql`${t.bracketId} IS NULL OR ${t.status} <> 'completed' OR ${t.bracketActivation} = 'not_required' OR ${t.winnerId} IS NOT NULL`
+    ),
     check(
       "matches_score_revision_nonnegative",
       sql`${t.scoreRevision} >= 0`
+    ),
+  ]
+);
+
+export const bracketMatchEdges = pgTable(
+  "bracket_match_edges",
+  {
+    bracketId: uuid("bracket_id")
+      .references(() => brackets.id, { onDelete: "cascade" })
+      .notNull(),
+    sourceMatchId: uuid("source_match_id").notNull(),
+    sourceOutcome: bracketOutcomeEnum("source_outcome").notNull(),
+    targetMatchId: uuid("target_match_id").notNull(),
+    targetSlot: bracketTargetSlotEnum("target_slot").notNull(),
+    condition: bracketFeedConditionEnum("condition").default("always").notNull(),
+  },
+  (t) => [
+    primaryKey({
+      name: "bracket_match_edges_pkey",
+      columns: [t.sourceMatchId, t.sourceOutcome],
+    }),
+    uniqueIndex("bracket_match_edges_target_slot_unique").on(
+      t.targetMatchId,
+      t.targetSlot
+    ),
+    index("bracket_match_edges_bracket_id_idx").on(t.bracketId),
+    index("bracket_match_edges_source_bracket_idx").on(
+      t.sourceMatchId,
+      t.bracketId
+    ),
+    index("bracket_match_edges_target_bracket_idx").on(
+      t.targetMatchId,
+      t.bracketId
+    ),
+    foreignKey({
+      name: "bracket_match_edges_source_same_bracket_fk",
+      columns: [t.sourceMatchId, t.bracketId],
+      foreignColumns: [matches.id, matches.bracketId],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "bracket_match_edges_target_same_bracket_fk",
+      columns: [t.targetMatchId, t.bracketId],
+      foreignColumns: [matches.id, matches.bracketId],
+    }).onDelete("cascade"),
+    check(
+      "bracket_match_edges_no_self_edge_check",
+      sql`${t.sourceMatchId} <> ${t.targetMatchId}`
     ),
   ]
 );
@@ -1219,6 +1344,7 @@ export const bracketsRelations = relations(brackets, ({ one, many }) => ({
     references: [divisions.id],
   }),
   matches: many(matches),
+  matchEdges: many(bracketMatchEdges),
 }));
 
 export const courtsRelations = relations(courts, ({ one, many }) => ({
@@ -1269,7 +1395,33 @@ export const matchesRelations = relations(matches, ({ one, many }) => ({
   }),
   sets: many(sets),
   scoreEvents: many(matchScoreEvents),
+  outgoingBracketEdges: many(bracketMatchEdges, {
+    relationName: "bracketEdgeSource",
+  }),
+  incomingBracketEdges: many(bracketMatchEdges, {
+    relationName: "bracketEdgeTarget",
+  }),
 }));
+
+export const bracketMatchEdgesRelations = relations(
+  bracketMatchEdges,
+  ({ one }) => ({
+    bracket: one(brackets, {
+      fields: [bracketMatchEdges.bracketId],
+      references: [brackets.id],
+    }),
+    sourceMatch: one(matches, {
+      fields: [bracketMatchEdges.sourceMatchId],
+      references: [matches.id],
+      relationName: "bracketEdgeSource",
+    }),
+    targetMatch: one(matches, {
+      fields: [bracketMatchEdges.targetMatchId],
+      references: [matches.id],
+      relationName: "bracketEdgeTarget",
+    }),
+  })
+);
 
 export const setsRelations = relations(sets, ({ one }) => ({
   match: one(matches, { fields: [sets.matchId], references: [matches.id] }),

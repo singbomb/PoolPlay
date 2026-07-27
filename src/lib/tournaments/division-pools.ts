@@ -19,14 +19,115 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
+  brackets,
   divisions,
+  matchScoreEvents,
+  matches,
   poolTeams,
   pools,
   registrations,
+  sets,
   teams,
 } from "@/lib/db/schema";
+import { OperationValidationError } from "@/lib/tournaments/competition-operation-rules";
 
 type DbClient = typeof db;
+
+async function assertStraightBracketCanReset(
+  bracketIds: string[],
+  client: DbClient
+): Promise<void> {
+  if (bracketIds.length === 0) return;
+  const matchRows = await client
+    .select({
+      id: matches.id,
+      status: matches.status,
+      teamAId: matches.teamAId,
+      teamBId: matches.teamBId,
+      warmupStartedAt: matches.warmupStartedAt,
+      startedAt: matches.startedAt,
+    })
+    .from(matches)
+    .where(inArray(matches.bracketId, bracketIds))
+    .orderBy(asc(matches.id))
+    .for("update");
+  const matchIds = matchRows.map((match) => match.id);
+  const hasPlayedMatch = matchRows.some(
+    (match) =>
+      match.status === "in_progress" ||
+      (match.status === "completed" &&
+        match.teamAId != null &&
+        match.teamBId != null) ||
+      match.warmupStartedAt != null ||
+      match.startedAt != null
+  );
+  if (hasPlayedMatch) {
+    throw new OperationValidationError(
+      "The elimination roster cannot change after bracket play starts."
+    );
+  }
+  if (matchIds.length === 0) return;
+  const [[storedSet], [scoreEvent]] = await Promise.all([
+    client
+      .select({ id: sets.id })
+      .from(sets)
+      .where(inArray(sets.matchId, matchIds))
+      .for("share")
+      .limit(1),
+    client
+      .select({ id: matchScoreEvents.id })
+      .from(matchScoreEvents)
+      .where(inArray(matchScoreEvents.matchId, matchIds))
+      .for("share")
+      .limit(1),
+  ]);
+  if (storedSet || scoreEvent) {
+    throw new OperationValidationError(
+      "The elimination roster cannot change after scores are recorded."
+    );
+  }
+}
+
+async function resetStraightBracketAfterRosterChange(
+  divisionId: string,
+  client: DbClient
+): Promise<void> {
+  const [division] = await client
+    .select({ format: divisions.format })
+    .from(divisions)
+    .where(eq(divisions.id, divisionId))
+    .for("update")
+    .limit(1);
+  if (
+    !division ||
+    (division.format !== "single_elimination" &&
+      division.format !== "double_elimination")
+  ) {
+    return;
+  }
+
+  const bracketRows = await client
+    .select({ id: brackets.id })
+    .from(brackets)
+    .where(eq(brackets.divisionId, divisionId))
+    .orderBy(asc(brackets.id))
+    .for("update");
+  const bracketIds = bracketRows.map((bracket) => bracket.id);
+  if (bracketIds.length > 0) {
+    await assertStraightBracketCanReset(bracketIds, client);
+    await client
+      .delete(matches)
+      .where(inArray(matches.bracketId, bracketIds));
+    await client
+      .update(brackets)
+      .set({ seedCount: 0, topologyVersion: 1 })
+      .where(inArray(brackets.id, bracketIds));
+  }
+  await client
+    .update(divisions)
+    .set({ poolsReleasedAt: null })
+    .where(eq(divisions.id, divisionId));
+}
 
 /**
  * Each division now has a single auto-created pool that mirrors the team list
@@ -145,6 +246,9 @@ export async function syncDivisionAutoPoolMembers(
     })
     .from(poolTeams)
     .where(eq(poolTeams.poolId, poolId));
+  const rosterChanged =
+    currentRows.length !== desiredIds.size ||
+    currentRows.some((row) => !desiredIds.has(row.teamId));
 
   const currentByTeam = new Map(currentRows.map((r) => [r.teamId, r]));
 
@@ -173,8 +277,11 @@ export async function syncDivisionAutoPoolMembers(
         })
         .onConflictDoNothing({
           target: [poolTeams.poolId, poolTeams.teamId],
-        });
+      });
     }
+  }
+  if (rosterChanged) {
+    await resetStraightBracketAfterRosterChange(divisionId, client);
   }
 }
 

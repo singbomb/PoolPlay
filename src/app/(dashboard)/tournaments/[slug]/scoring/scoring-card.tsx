@@ -56,6 +56,7 @@ interface ScoringMatch {
   teamB: { id: string; name: string } | null;
   courtName: string | null;
   refTeamName: string | null;
+  contextLabel: string | null;
   winnerId: string | null;
   scoreRevision: number;
   sets: MatchSet[];
@@ -187,6 +188,8 @@ export function ScoringCard({
           <StatusBadge kind="match" status={match.status} />
         </div>
         <p className="text-xs text-muted-foreground">
+          {match.contextLabel}
+          {match.contextLabel && match.courtName && " · "}
           {match.courtName && `${match.courtName}`}
           {match.scheduledTime && (() => {
             const warmupMinutes = warmupMinutesForFormat(warmupFormat);

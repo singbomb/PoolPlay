@@ -29,10 +29,8 @@ import {
   registrations,
   pools,
   poolTeams,
-  schoolMembers,
-  users,
 } from "@/lib/db/schema";
-import { eq, and, count, or, sql } from "drizzle-orm";
+import { eq, and, count, sql } from "drizzle-orm";
 import { requireUser } from "@/lib/auth";
 import {
   resolveIsTournamentOrganizer,
@@ -45,15 +43,14 @@ import {
   countTournamentCombinedBracketTeams,
   regenerateTournamentCombinedBracketsInTransaction,
   tournamentCombinedBracketsRegenerateState,
-  tryFillBracketFromDivisionSeeds,
 } from "@/lib/tournaments/bracket-structure";
+import { seedStraightEliminationDivision } from "@/lib/tournaments/straight-elimination-seeding";
+import { loadLockedTournamentForOrganizer } from "@/lib/tournaments/locked-tournament-authorization";
 import {
   eligibleBracketRefIds,
   type BracketMatchForRefs,
 } from "@/lib/tournaments/bracket-refs";
 import { validateBracketTierSettings } from "@/lib/tournaments/bracket-tiers";
-import { assertMatchBelongsToAuthorizedTournament } from "@/lib/security/authorization-invariants";
-import { getMatchTournamentId } from "@/lib/tournaments/match-query";
 import { isTournamentArchived } from "@/lib/tournament-status";
 import {
   OperationConflictError,
@@ -71,51 +68,6 @@ function bracketOperationError(error: unknown, fallback: string): string {
   }
   console.error(fallback, error);
   return fallback;
-}
-
-async function loadLockedTournamentForOrganizer(
-  tournamentId: string,
-  actorUserId: string,
-  executor: BracketActionDbClient
-): Promise<typeof tournaments.$inferSelect | null> {
-  await executor.execute(sql`
-    SELECT id
-    FROM ${tournaments}
-    WHERE ${tournaments.id} = ${tournamentId}
-    FOR UPDATE
-  `);
-  const [tournament] = await executor
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, tournamentId))
-    .limit(1);
-  const [actor] = await executor
-    .select({ role: users.role, disabledAt: users.disabledAt })
-    .from(users)
-    .where(eq(users.id, actorUserId))
-    .for("share")
-    .limit(1);
-  if (!tournament || !actor || actor.disabledAt != null) return null;
-  if (tournament.organizerId === actorUserId || actor.role === "admin") {
-    return tournament;
-  }
-  if (!tournament.hostSchoolId) return null;
-  const [officer] = await executor
-    .select({ id: schoolMembers.id })
-    .from(schoolMembers)
-    .where(
-      and(
-        eq(schoolMembers.schoolId, tournament.hostSchoolId),
-        eq(schoolMembers.userId, actorUserId),
-        or(
-          eq(schoolMembers.role, "president"),
-          eq(schoolMembers.role, "officer")
-        )
-      )
-    )
-    .for("share")
-    .limit(1);
-  return officer ? tournament : null;
 }
 
 /**
@@ -184,6 +136,12 @@ export async function updatePoolSeeding(
       if (division.tournamentId !== tournamentId) {
         return { error: "Tournament mismatch" };
       }
+      if (division.format !== "pool_to_bracket") {
+        return {
+          error:
+            "Pool-match generation is only available for pool-to-bracket divisions.",
+        };
+      }
 
       const members = await executor
         .select({ teamId: poolTeams.teamId })
@@ -217,9 +175,6 @@ export async function updatePoolSeeding(
       if (regenerated.error) {
         throw new OperationValidationError(regenerated.error);
       }
-      if (division.format === "single_elimination") {
-        await tryFillBracketFromDivisionSeeds(division.id, executor);
-      }
       return { matchCount: regenerated.matchCount ?? 0 };
     });
     if ("error" in result) return { error: result.error };
@@ -238,6 +193,98 @@ export async function updatePoolSeeding(
   };
 }
 
+/**
+ * Save seed order and generate a straight-elimination bracket without creating
+ * any round-robin pool matches.
+ */
+export async function updateEliminationSeeding(
+  tournamentId: string,
+  poolId: string,
+  orderedTeamIds: string[]
+) {
+  const user = await requireUser();
+  const uniqueIds = [...new Set(orderedTeamIds)];
+  if (uniqueIds.length < 2) {
+    return { error: "Need at least 2 teams to set seeding" };
+  }
+
+  try {
+    const result = await db.transaction(async (tx) => {
+      const executor = tx as unknown as BracketActionDbClient;
+      const tournament = await loadLockedTournamentForOrganizer(
+        tournamentId,
+        user.id,
+        executor
+      );
+      if (!tournament) {
+        return {
+          error:
+            "Elimination seeding can only be updated by the current organizer.",
+        };
+      }
+      if (
+        tournament.status !== "registration_closed" ||
+        isTournamentArchived(tournament.date)
+      ) {
+        return {
+          error:
+            "Elimination seeding can only be updated after registration closes.",
+        };
+      }
+
+      const [{ value: pendingCount }] = await executor
+        .select({ value: count() })
+        .from(registrations)
+        .where(
+          and(
+            eq(registrations.tournamentId, tournamentId),
+            eq(registrations.status, "pending")
+          )
+        );
+      const blocked = poolAssignmentBlockedMessage(pendingCount ?? 0);
+      if (blocked) return { error: blocked };
+
+      const [division] = await executor
+        .select({
+          id: divisions.id,
+          tournamentId: divisions.tournamentId,
+        })
+        .from(pools)
+        .innerJoin(divisions, eq(pools.divisionId, divisions.id))
+        .where(eq(pools.id, poolId))
+        .for("share")
+        .limit(1);
+      if (!division || division.tournamentId !== tournamentId) {
+        return { error: "Division not found" };
+      }
+
+      return seedStraightEliminationDivision(
+        {
+          tournamentId,
+          divisionId: division.id,
+          orderedTeamIds: uniqueIds,
+        },
+        executor
+      );
+    });
+    if ("error" in result) return { error: result.error };
+
+    revalidatePath("/tournaments/[slug]", "page");
+    revalidatePath("/tournaments/[slug]/brackets", "page");
+    return {
+      success: true as const,
+      matchCount: result.matchCount,
+    };
+  } catch (error) {
+    return {
+      error: bracketOperationError(
+        error,
+        "Could not generate the elimination bracket"
+      ),
+    };
+  }
+}
+
 /** Override the auto-assigned working/ref team for a pool or bracket match. */
 export async function updateMatchRef(
   tournamentId: string,
@@ -246,138 +293,146 @@ export async function updateMatchRef(
 ) {
   const user = await requireUser();
 
-  const matchTournamentId = await getMatchTournamentId(matchId);
-  if (!matchTournamentId) {
-    return { error: "Resource not found or access denied" };
-  }
-
   try {
-    assertMatchBelongsToAuthorizedTournament({
-      matchTournamentId,
-      authorizedTournamentId: tournamentId,
+    const result = await db.transaction(async (tx) => {
+      const executor = tx as unknown as BracketActionDbClient;
+      const tournament = await loadLockedTournamentForOrganizer(
+        tournamentId,
+        user.id,
+        executor
+      );
+      if (!tournament) {
+        return {
+          error: "Only the current organizer can change the working team",
+        };
+      }
+
+      await executor.execute(sql`
+        SELECT id
+        FROM ${matches}
+        WHERE ${matches.id} = ${matchId}
+          AND ${matches.tournamentId} = ${tournamentId}
+        FOR UPDATE
+      `);
+      const [match] = await executor
+        .select({
+          id: matches.id,
+          poolId: matches.poolId,
+          bracketId: matches.bracketId,
+          bracketRound: matches.bracketRound,
+          bracketPosition: matches.bracketPosition,
+          teamAId: matches.teamAId,
+          teamBId: matches.teamBId,
+          status: matches.status,
+          courtId: matches.courtId,
+          scheduledTime: matches.scheduledTime,
+          winnerId: matches.winnerId,
+        })
+        .from(matches)
+        .where(
+          and(
+            eq(matches.id, matchId),
+            eq(matches.tournamentId, tournamentId)
+          )
+        )
+        .limit(1);
+
+      if (!match || (!match.poolId && !match.bracketId)) {
+        return { error: "Resource not found or access denied" };
+      }
+      if (match.status === "completed") {
+        return { error: "Match is already completed" };
+      }
+      if (
+        refTeamId !== null &&
+        (refTeamId === match.teamAId || refTeamId === match.teamBId)
+      ) {
+        return { error: "Working team can't be one of the playing teams" };
+      }
+
+      if (refTeamId !== null && match.poolId) {
+        const [member] = await executor
+          .select({ teamId: poolTeams.teamId })
+          .from(poolTeams)
+          .where(
+            and(
+              eq(poolTeams.poolId, match.poolId),
+              eq(poolTeams.teamId, refTeamId)
+            )
+          )
+          .for("share")
+          .limit(1);
+        if (!member) {
+          return { error: "Working team must be in the same pool" };
+        }
+      }
+
+      if (refTeamId !== null && match.bracketId) {
+        const bracketRows = await executor
+          .select({
+            id: matches.id,
+            bracketSection: matches.bracketSection,
+            bracketRound: matches.bracketRound,
+            bracketPosition: matches.bracketPosition,
+            teamAId: matches.teamAId,
+            teamBId: matches.teamBId,
+            winnerId: matches.winnerId,
+            status: matches.status,
+            courtId: matches.courtId,
+            scheduledTime: matches.scheduledTime,
+          })
+          .from(matches)
+          .where(eq(matches.bracketId, match.bracketId))
+          .for("share");
+
+        const allForRefs: BracketMatchForRefs[] = bracketRows
+          .filter((row) => row.bracketRound != null && row.bracketPosition != null)
+          .map((row) => ({
+            id: row.id,
+            bracketSection: row.bracketSection,
+            bracketRound: row.bracketRound!,
+            bracketPosition: row.bracketPosition!,
+            teamAId: row.teamAId,
+            teamBId: row.teamBId,
+            winnerId: row.winnerId,
+            status: row.status,
+            courtId: row.courtId,
+            scheduledTime: row.scheduledTime,
+          }));
+        const target = allForRefs.find((row) => row.id === match.id);
+        if (!target) {
+          return { error: "Match not found" };
+        }
+        if (!eligibleBracketRefIds(target, allForRefs).includes(refTeamId)) {
+          return {
+            error: "Selected working team is not eligible for this match",
+          };
+        }
+      }
+
+      const [updatedMatch] = await executor
+        .update(matches)
+        .set({ refTeamId, updatedAt: new Date() })
+        .where(
+          and(
+            eq(matches.id, matchId),
+            eq(matches.tournamentId, tournamentId)
+          )
+        )
+        .returning({ id: matches.id });
+      return updatedMatch
+        ? { success: true as const }
+        : { error: "Resource not found or access denied" };
     });
-  } catch {
-    return { error: "Resource not found or access denied" };
+
+    if ("error" in result) return result;
+    revalidatePath("/tournaments/[slug]", "page");
+    revalidatePath("/tournaments/[slug]/scoring", "page");
+    return result;
+  } catch (error) {
+    console.error("Could not change the working team", error);
+    return { error: "Could not change the working team" };
   }
-
-  const [match] = await db
-    .select({
-      id: matches.id,
-      poolId: matches.poolId,
-      bracketId: matches.bracketId,
-      bracketRound: matches.bracketRound,
-      bracketPosition: matches.bracketPosition,
-      teamAId: matches.teamAId,
-      teamBId: matches.teamBId,
-      status: matches.status,
-      courtId: matches.courtId,
-      scheduledTime: matches.scheduledTime,
-      winnerId: matches.winnerId,
-    })
-    .from(matches)
-    .where(eq(matches.id, matchId))
-    .limit(1);
-
-  if (!match || (!match.poolId && !match.bracketId)) {
-    return { error: "Resource not found or access denied" };
-  }
-
-  const [tournament] = await db
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, matchTournamentId))
-    .limit(1);
-
-  if (!tournament || !await resolveIsTournamentOrganizer(tournament, user)) {
-    return { error: "Only the organizer can change the working team" };
-  }
-
-  if (match.status === "completed") {
-    return { error: "Match is already completed" };
-  }
-
-  if (
-    refTeamId !== null &&
-    (refTeamId === match.teamAId || refTeamId === match.teamBId)
-  ) {
-    return { error: "Working team can't be one of the playing teams" };
-  }
-
-  if (refTeamId !== null && match.poolId) {
-    const [member] = await db
-      .select({ teamId: poolTeams.teamId })
-      .from(poolTeams)
-      .where(
-        and(eq(poolTeams.poolId, match.poolId), eq(poolTeams.teamId, refTeamId))
-      )
-      .limit(1);
-    if (!member) {
-      return { error: "Working team must be in the same pool" };
-    }
-  }
-
-  if (refTeamId !== null && match.bracketId) {
-    const bracketRows = await db
-      .select({
-        id: matches.id,
-        bracketRound: matches.bracketRound,
-        bracketPosition: matches.bracketPosition,
-        teamAId: matches.teamAId,
-        teamBId: matches.teamBId,
-        winnerId: matches.winnerId,
-        status: matches.status,
-        courtId: matches.courtId,
-        scheduledTime: matches.scheduledTime,
-      })
-      .from(matches)
-      .where(eq(matches.bracketId, match.bracketId));
-
-    const allForRefs: BracketMatchForRefs[] = bracketRows
-      .filter((m) => m.bracketRound != null && m.bracketPosition != null)
-      .map((m) => ({
-        id: m.id,
-        bracketRound: m.bracketRound!,
-        bracketPosition: m.bracketPosition!,
-        teamAId: m.teamAId,
-        teamBId: m.teamBId,
-        winnerId: m.winnerId,
-        status: m.status,
-        courtId: m.courtId,
-        scheduledTime: m.scheduledTime,
-      }));
-
-    const target = allForRefs.find((m) => m.id === match.id);
-    if (!target) {
-      return { error: "Match not found" };
-    }
-
-    const eligible = eligibleBracketRefIds(target, allForRefs);
-    if (!eligible.includes(refTeamId)) {
-      return {
-        error:
-          "Ref must be a bye team, a team from a later match on the same court, or a loser from the previous round",
-      };
-    }
-  }
-
-  const [updatedMatch] = await db
-    .update(matches)
-    .set({ refTeamId, updatedAt: new Date() })
-    .where(
-      and(
-        eq(matches.id, matchId),
-        eq(matches.tournamentId, matchTournamentId)
-      )
-    )
-    .returning({ id: matches.id });
-
-  if (!updatedMatch) {
-    return { error: "Resource not found or access denied" };
-  }
-
-  revalidatePath("/tournaments/[slug]", "page");
-  revalidatePath("/tournaments/[slug]/scoring", "page");
-  return { success: true as const };
 }
 
 /** Assign a court to a bracket match and refresh round-1 ref suggestions. */
@@ -388,77 +443,81 @@ export async function updateBracketMatchCourt(
 ) {
   const user = await requireUser();
 
-  const matchTournamentId = await getMatchTournamentId(matchId);
-  if (!matchTournamentId) {
-    return { error: "Resource not found or access denied" };
-  }
-
   try {
-    assertMatchBelongsToAuthorizedTournament({
-      matchTournamentId,
-      authorizedTournamentId: tournamentId,
+    const result = await db.transaction(async (tx) => {
+      const executor = tx as unknown as BracketActionDbClient;
+      const tournament = await loadLockedTournamentForOrganizer(
+        tournamentId,
+        user.id,
+        executor
+      );
+      if (!tournament || isTournamentArchived(tournament.date)) {
+        return { error: "Only the organizer can assign courts" };
+      }
+
+      const [match] = await executor
+        .select({
+          id: matches.id,
+          bracketId: matches.bracketId,
+          status: matches.status,
+        })
+        .from(matches)
+        .where(
+          and(
+            eq(matches.id, matchId),
+            eq(matches.tournamentId, tournament.id)
+          )
+        )
+        .for("update")
+        .limit(1);
+      if (!match?.bracketId) {
+        return { error: "Resource not found or access denied" };
+      }
+      if (match.status === "completed") {
+        return { error: "Match is already completed" };
+      }
+
+      if (courtId) {
+        const [court] = await executor
+          .select({ id: courts.id })
+          .from(courts)
+          .where(
+            and(
+              eq(courts.id, courtId),
+              eq(courts.tournamentId, tournament.id)
+            )
+          )
+          .for("share")
+          .limit(1);
+        if (!court) {
+          return { error: "Court not found" };
+        }
+      }
+
+      const [updatedMatch] = await executor
+        .update(matches)
+        .set({ courtId, updatedAt: new Date() })
+        .where(
+          and(
+            eq(matches.id, matchId),
+            eq(matches.tournamentId, tournament.id)
+          )
+        )
+        .returning({ id: matches.id });
+      if (!updatedMatch) {
+        return { error: "Resource not found or access denied" };
+      }
+
+      await assignBracketRefsForBracket(match.bracketId, executor, {
+        resetRoundOneCourtId: courtId,
+      });
+      return { success: true as const };
     });
-  } catch {
-    return { error: "Resource not found or access denied" };
+    if ("error" in result) return result;
+  } catch (error) {
+    console.error("Could not assign the bracket court", error);
+    return { error: "Could not assign the bracket court" };
   }
-
-  const [match] = await db
-    .select({
-      id: matches.id,
-      bracketId: matches.bracketId,
-      status: matches.status,
-    })
-    .from(matches)
-    .where(eq(matches.id, matchId))
-    .limit(1);
-
-  if (!match?.bracketId) {
-    return { error: "Resource not found or access denied" };
-  }
-
-  const [tournament] = await db
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, matchTournamentId))
-    .limit(1);
-
-  if (!tournament || !await resolveIsTournamentOrganizer(tournament, user)) {
-    return { error: "Only the organizer can assign courts" };
-  }
-
-  if (match.status === "completed") {
-    return { error: "Match is already completed" };
-  }
-
-  if (courtId) {
-    const [court] = await db
-      .select({ id: courts.id })
-      .from(courts)
-      .where(and(eq(courts.id, courtId), eq(courts.tournamentId, tournamentId)))
-      .limit(1);
-    if (!court) {
-      return { error: "Court not found" };
-    }
-  }
-
-  const [updatedMatch] = await db
-    .update(matches)
-    .set({ courtId, updatedAt: new Date() })
-    .where(
-      and(
-        eq(matches.id, matchId),
-        eq(matches.tournamentId, matchTournamentId)
-      )
-    )
-    .returning({ id: matches.id });
-
-  if (!updatedMatch) {
-    return { error: "Resource not found or access denied" };
-  }
-
-  await assignBracketRefsForBracket(match.bracketId, db, {
-    resetRoundOneCourtId: courtId,
-  });
 
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/schedule");

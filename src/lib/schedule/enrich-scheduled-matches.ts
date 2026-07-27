@@ -31,6 +31,11 @@ import {
   warmupMinutesForFormat,
   type WarmupFormat,
 } from "@/lib/labels/warmup-format";
+import {
+  formatBracketRoundLabel,
+  type BracketSection,
+} from "@/lib/tournaments/bracket-labels";
+import { isActiveMatch } from "@/lib/tournaments/match-visibility";
 
 export type ScheduledMatchRow = typeof matches.$inferSelect;
 
@@ -47,14 +52,15 @@ export type EnrichedScheduledMatch = ScheduledMatchRow & {
 export async function enrichScheduledMatches(
   scheduledMatches: ScheduledMatchRow[]
 ): Promise<EnrichedScheduledMatch[]> {
-  if (scheduledMatches.length === 0) return [];
+  const activeMatches = scheduledMatches.filter(isActiveMatch);
+  if (activeMatches.length === 0) return [];
 
   const teamIds = new Set<string>();
   const courtIds = new Set<string>();
   const poolIds = new Set<string>();
   const bracketIds = new Set<string>();
 
-  for (const match of scheduledMatches) {
+  for (const match of activeMatches) {
     if (match.teamAId) teamIds.add(match.teamAId);
     if (match.teamBId) teamIds.add(match.teamBId);
     if (match.refTeamId) teamIds.add(match.refTeamId);
@@ -108,7 +114,7 @@ export async function enrichScheduledMatches(
     bracketRows.map((row) => [row.id, row.warmupFormat])
   );
 
-  return scheduledMatches.map((match) => {
+  return activeMatches.map((match) => {
     let contextLabel = "";
     let warmupFormat: WarmupFormat = "none";
 
@@ -119,7 +125,10 @@ export async function enrichScheduledMatches(
     } else if (match.bracketId) {
       warmupFormat = bracketWarmupById.get(match.bracketId) ?? "none";
       if (match.bracketRound) {
-        contextLabel = `Bracket R${match.bracketRound}`;
+        contextLabel = formatBracketRoundLabel({
+          section: (match.bracketSection ?? "main") as BracketSection,
+          round: match.bracketRound,
+        });
       }
     }
 

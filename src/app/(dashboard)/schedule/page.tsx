@@ -18,8 +18,26 @@
 
 import { getCurrentUser } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { matches, tournaments } from "@/lib/db/schema";
-import { eq, isNotNull, asc } from "drizzle-orm";
+import {
+  brackets,
+  divisions,
+  matches,
+  pools,
+  schoolMembers,
+  tournaments,
+} from "@/lib/db/schema";
+import {
+  and,
+  asc,
+  eq,
+  getTableColumns,
+  inArray,
+  isNotNull,
+  ne,
+  or,
+  sql,
+} from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { PageHeader } from "@/components/layout/page-header";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -32,20 +50,80 @@ import { pageMetadata } from "@/lib/metadata";
 
 export const metadata = pageMetadata("Schedule");
 
+const schedulePoolDivision = alias(divisions, "schedule_page_pool_division");
+const scheduleBracketDivision = alias(
+  divisions,
+  "schedule_page_bracket_division"
+);
+
 export default async function SchedulePage() {
   const user = await getCurrentUser();
   if (!user) redirect("/login");
 
+  const schoolMembershipRows = await db
+    .select({
+      schoolId: schoolMembers.schoolId,
+      role: schoolMembers.role,
+    })
+    .from(schoolMembers)
+    .where(eq(schoolMembers.userId, user.id));
+  const memberSchoolIds = schoolMembershipRows.map((row) => row.schoolId);
+  const officerSchoolIds = schoolMembershipRows
+    .filter((row) => row.role === "president" || row.role === "officer")
+    .map((row) => row.schoolId);
+  const managesTournament =
+    officerSchoolIds.length > 0
+      ? or(
+          eq(tournaments.organizerId, user.id),
+          inArray(tournaments.hostSchoolId, officerSchoolIds)
+        )
+      : eq(tournaments.organizerId, user.id);
+  const releasedPlay = or(
+    isNotNull(schedulePoolDivision.poolsReleasedAt),
+    isNotNull(scheduleBracketDivision.poolsReleasedAt)
+  );
+  const canViewPublishedTournament =
+    memberSchoolIds.length > 0
+      ? or(
+          ne(tournaments.status, "draft"),
+          inArray(tournaments.hostSchoolId, memberSchoolIds)
+        )
+      : ne(tournaments.status, "draft");
+  const canViewScheduledMatch =
+    user.role === "admin"
+      ? sql<boolean>`true`
+      : or(
+          managesTournament,
+          and(canViewPublishedTournament, releasedPlay)
+        );
+
   const [scheduledMatches, userTournaments] = await Promise.all([
     db
-      .select()
+      .select(getTableColumns(matches))
       .from(matches)
-      .where(isNotNull(matches.scheduledTime))
+      .innerJoin(tournaments, eq(matches.tournamentId, tournaments.id))
+      .leftJoin(pools, eq(matches.poolId, pools.id))
+      .leftJoin(
+        schedulePoolDivision,
+        eq(pools.divisionId, schedulePoolDivision.id)
+      )
+      .leftJoin(brackets, eq(matches.bracketId, brackets.id))
+      .leftJoin(
+        scheduleBracketDivision,
+        eq(brackets.divisionId, scheduleBracketDivision.id)
+      )
+      .where(and(isNotNull(matches.scheduledTime), canViewScheduledMatch))
       .orderBy(asc(matches.scheduledTime)),
-    db
-      .select({ id: tournaments.id, name: tournaments.name })
-      .from(tournaments)
-      .where(eq(tournaments.organizerId, user.id)),
+    user.role === "admin"
+      ? db
+          .select({ id: tournaments.id, name: tournaments.name })
+          .from(tournaments)
+          .orderBy(asc(tournaments.name))
+      : db
+          .select({ id: tournaments.id, name: tournaments.name })
+          .from(tournaments)
+          .where(managesTournament)
+          .orderBy(asc(tournaments.name)),
   ]);
 
   const enrichedMatches = await enrichScheduledMatches(scheduledMatches);

@@ -35,6 +35,17 @@ export function isBracketMatch(match: {
   return match.bracketId != null;
 }
 
+/** Elimination matches add a deciding set when a two-set format splits 1–1. */
+export function matchFormatForMatch(
+  format: MatchFormat,
+  match: { bracketId: string | null }
+): MatchFormat {
+  if (isBracketMatch(match) && format === "best_of_2") {
+    return "two_with_tiebreak";
+  }
+  return format;
+}
+
 /** Pool matches use `setStartingScore`; bracket matches use `bracketSetStartingScore`. */
 export function setStartingScoreForMatch(
   tournament: {

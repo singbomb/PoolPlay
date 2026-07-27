@@ -23,7 +23,12 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { EmptyState } from "@/components/ui/empty-state";
-import { buildMatchScoreState } from "@/lib/tournaments/match-format";
+import {
+  buildMatchScoreState,
+  matchFormatForMatch,
+} from "@/lib/tournaments/match-format";
+import { formatBracketRoundLabel } from "@/lib/tournaments/bracket-labels";
+import { isPlayableMatch } from "@/lib/tournaments/match-visibility";
 import type { MatchFormat } from "@/lib/labels/match-format";
 import { isBracketRoundOneByeMatch } from "@/lib/utils/bracket";
 import { cn } from "@/lib/utils";
@@ -46,6 +51,7 @@ interface BoardMatch {
   teamAId: string | null;
   teamBId: string | null;
   refName: string | null;
+  bracketId: string | null;
   sets: MatchSet[];
 }
 
@@ -72,6 +78,7 @@ function flattenMatches(divisions: DivisionPlayData[]): BoardMatch[] {
           teamAId: m.teamAId,
           teamBId: m.teamBId,
           refName: m.ref?.name ?? null,
+          bracketId: null,
           sets: m.sets,
         });
       }
@@ -79,6 +86,7 @@ function flattenMatches(divisions: DivisionPlayData[]): BoardMatch[] {
     for (const bracket of div.brackets) {
       for (const m of bracket.matches) {
         if (!m.teamAName && !m.teamBName) continue;
+        if (!isPlayableMatch({ ...m, bracketId: bracket.id })) continue;
         if (
           isBracketRoundOneByeMatch({
             bracketRound: m.bracketRound,
@@ -93,13 +101,17 @@ function flattenMatches(divisions: DivisionPlayData[]): BoardMatch[] {
           slug: m.slug,
           status: m.status,
           scheduledTime: m.scheduledTime,
-          context: `${div.name} · Bracket`,
+          context: `${div.name} · ${formatBracketRoundLabel({
+            section: m.bracketSection,
+            round: m.bracketRound ?? 1,
+          })}`,
           teamAName: m.teamAName,
           teamBName: m.teamBName,
           winnerId: m.winnerId,
           teamAId: m.teamAId,
           teamBId: m.teamBId,
           refName: null,
+          bracketId: bracket.id,
           sets: m.sets,
         });
       }
@@ -123,7 +135,14 @@ function MatchCard({
   match: BoardMatch;
   settings: FormatSettings;
 }) {
-  const { setsWonA, setsWonB } = buildMatchScoreState(settings, match.sets);
+  const effectiveSettings = {
+    ...settings,
+    format: matchFormatForMatch(settings.format, match),
+  };
+  const { setsWonA, setsWonB } = buildMatchScoreState(
+    effectiveSettings,
+    match.sets
+  );
   const teamA = match.teamAName ?? "TBD";
   const teamB = match.teamBName ?? "TBD";
   const aWon = match.winnerId != null && match.winnerId === match.teamAId;

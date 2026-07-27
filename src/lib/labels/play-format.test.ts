@@ -38,25 +38,25 @@ const validTournament = {
   location: "Campus Gym",
 };
 
-describe("play-format release guard", () => {
-  it("hides double elimination from new-tournament choices", () => {
+describe("play-format choices", () => {
+  it("offers every supported competition format", () => {
     assert.deepEqual(
       PLAY_FORMAT_OPTIONS.map((option) => option.value),
-      ["pool_to_bracket", "single_elimination"]
+      ["pool_to_bracket", "single_elimination", "double_elimination"]
     );
   });
 
-  it("rejects double elimination for new tournaments", () => {
+  it("accepts double elimination for new tournaments", () => {
     assert.equal(
       createTournamentSchema.safeParse({
         ...validTournament,
         playFormat: "double_elimination",
       }).success,
-      false
+      true
     );
   });
 
-  it("keeps the legacy enum value and display label readable", () => {
+  it("keeps the enum value and display label readable", () => {
     assert.ok(PLAY_FORMATS.includes("double_elimination"));
     assert.equal(
       formatPlayFormatLabel("double_elimination"),
@@ -64,18 +64,14 @@ describe("play-format release guard", () => {
     );
   });
 
-  it("guards both tournament creation and legacy division creation", () => {
+  it("validates tournament creation against the supported formats", () => {
     assert.match(
       tournamentActions,
       /!isCreatablePlayFormat\(requestedPlayFormat\)/
     );
-    assert.match(
-      tournamentActions,
-      /!isCreatablePlayFormat\(tournament\.playFormat\)/
-    );
-    assert.match(
+    assert.doesNotMatch(
       bracketStructure,
-      /ensureDivisionBracketSkeleton[\s\S]*!isCreatablePlayFormat\(format\)[\s\S]*throw new Error\(DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE\)/
+      /DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE/
     );
   });
 });

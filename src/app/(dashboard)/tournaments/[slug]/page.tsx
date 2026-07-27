@@ -36,6 +36,7 @@ import { BackLink } from "@/components/layout/back-link";
 import { TeamAttributesBadges } from "@/components/team-attributes-badges";
 import { TournamentHostSchoolLink } from "@/components/tournament-host-school-link";
 import { TournamentLocationLink } from "@/components/tournament-location-link";
+import { MatchRealtimeRefresh } from "@/components/realtime/match-realtime-refresh";
 import { formatTournamentDateDisplay } from "@/lib/date-iso";
 import {
   canEditTournamentSetup,
@@ -319,6 +320,7 @@ export default async function TournamentDetailPage({
 
   return (
     <div className={emptySetup ? "space-y-3 pb-6" : "space-y-6 pb-6"}>
+      <MatchRealtimeRefresh tournamentId={id} />
       <BackLink href="/tournaments">All tournaments</BackLink>
 
       {isOrganizer ? (

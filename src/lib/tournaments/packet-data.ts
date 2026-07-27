@@ -29,8 +29,12 @@ import {
   users,
 } from "@/lib/db/schema";
 import { and, asc, eq, inArray, isNotNull } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { TEAM_GENDER_LABELS, TEAM_REGION_LABELS } from "@/lib/constants/team";
-import { formatMatchFormatLabel } from "@/lib/labels/match-format";
+import {
+  formatMatchFormatLabel,
+  type MatchFormat,
+} from "@/lib/labels/match-format";
 import { formatPlayFormatLabel } from "@/lib/labels/play-format";
 import {
   formatPoolTiebreakCriterionLabel,
@@ -39,6 +43,13 @@ import {
 import { formatWarmupFormatLabel } from "@/lib/labels/warmup-format";
 import { formatTournamentDateDisplay } from "@/lib/date-iso";
 import { getHostSchoolById } from "@/lib/tournaments/host-school";
+import {
+  formatBracketRoundLabel,
+  formatBracketRulesSummary,
+  type BracketSection,
+} from "@/lib/tournaments/bracket-labels";
+import { isActiveMatch } from "@/lib/tournaments/match-visibility";
+import { matchFormatForMatch } from "@/lib/tournaments/match-format";
 import {
   paymentInstructionsText,
   paymentSettingsFromTournament,
@@ -76,6 +87,7 @@ export type PacketData = {
   organizerName: string;
   registeredTeams: PacketRegisteredTeam[];
   playFormatLabel: string;
+  hasPoolPlay: boolean;
   poolRules: {
     matchFormat: string;
     matchFormatLabel: string;
@@ -88,6 +100,11 @@ export type PacketData = {
   bracketRules: {
     summary: string;
     bracketCount: number;
+    matchFormat: MatchFormat;
+    matchFormatLabel: string;
+    setStartingScore: number;
+    setTargetScore: number;
+    tiebreakTargetScore: number;
   } | null;
   schedule: PacketScheduleRow[];
 };
@@ -107,29 +124,26 @@ function tournamentLiveUrl(slug: string): string {
   return `${base}/tournaments/${slug}`;
 }
 
-function bracketRoundLabel(round: number, maxRound: number): string {
-  if (round === maxRound) return "Final";
-  if (round === maxRound - 1) return "Semifinals";
-  if (round === maxRound - 2) return "Quarterfinals";
-  return `Round ${round}`;
-}
+const packetPoolDivision = alias(divisions, "packet_pool_division");
+const packetBracketDivision = alias(divisions, "packet_bracket_division");
 
-function bracketTierSummary(
-  bracketCount: number,
-  goldTeamCount: number | null,
-  silverTeamCount: number | null
-): string {
-  if (bracketCount <= 1) {
-    return "Single elimination bracket (all pools combine). Sets start at 0–0.";
-  }
-  if (bracketCount === 2) {
-    return `Gold (${goldTeamCount ?? "?"} teams) and Silver (remainder) brackets. All pools combine. Sets start at 0–0.`;
-  }
-  return `Gold (${goldTeamCount ?? "?"}), Silver (${silverTeamCount ?? "?"}), and Bronze (remainder) brackets. All pools combine. Sets start at 0–0.`;
+export function packetScheduleMatchIsVisible(
+  match: {
+    poolReleasedAt: Date | null;
+    bracketReleasedAt: Date | null;
+  },
+  includeUnreleased: boolean
+): boolean {
+  return (
+    includeUnreleased ||
+    match.poolReleasedAt != null ||
+    match.bracketReleasedAt != null
+  );
 }
 
 export async function gatherPacketData(
-  tournamentId: string
+  tournamentId: string,
+  options?: { includeUnreleased?: boolean }
 ): Promise<PacketData | null> {
   const [tournament] = await db
     .select()
@@ -139,7 +153,7 @@ export async function gatherPacketData(
 
   if (!tournament) return null;
 
-  const [organizer, hostSchool, registrationRows, scheduledMatchRows] =
+  const [organizer, hostSchool, registrationRows, rawScheduledMatchRows] =
     await Promise.all([
       db
         .select({ fullName: users.fullName })
@@ -164,14 +178,29 @@ export async function gatherPacketData(
       db
         .select({
           scheduledTime: matches.scheduledTime,
+          status: matches.status,
+          bracketActivation: matches.bracketActivation,
+          bracketSection: matches.bracketSection,
           bracketRound: matches.bracketRound,
           bracketId: matches.bracketId,
           poolId: matches.poolId,
           teamAId: matches.teamAId,
           teamBId: matches.teamBId,
           courtId: matches.courtId,
+          poolReleasedAt: packetPoolDivision.poolsReleasedAt,
+          bracketReleasedAt: packetBracketDivision.poolsReleasedAt,
         })
         .from(matches)
+        .leftJoin(pools, eq(matches.poolId, pools.id))
+        .leftJoin(
+          packetPoolDivision,
+          eq(pools.divisionId, packetPoolDivision.id)
+        )
+        .leftJoin(brackets, eq(matches.bracketId, brackets.id))
+        .leftJoin(
+          packetBracketDivision,
+          eq(brackets.divisionId, packetBracketDivision.id)
+        )
         .where(
           and(
             eq(matches.tournamentId, tournamentId),
@@ -180,6 +209,15 @@ export async function gatherPacketData(
         )
         .orderBy(asc(matches.scheduledTime)),
     ]);
+
+  const scheduledMatchRows = rawScheduledMatchRows
+    .filter(isActiveMatch)
+    .filter((match) =>
+      packetScheduleMatchIsVisible(
+        match,
+        options?.includeUnreleased === true
+      )
+    );
 
   const teamIds = [
     ...new Set(
@@ -240,6 +278,7 @@ export async function gatherPacketData(
         ? db
             .select({
               bracketId: matches.bracketId,
+              bracketSection: matches.bracketSection,
               maxRound: matches.bracketRound,
             })
             .from(matches)
@@ -259,12 +298,13 @@ export async function gatherPacketData(
     bracketRows.map((b) => [b.id, b.name ?? "Bracket"])
   );
 
-  const maxRoundByBracket = new Map<string, number>();
+  const maxRoundByBracketSection = new Map<string, number>();
   for (const row of bracketMaxRounds) {
-    if (!row.bracketId || row.maxRound == null) continue;
-    const prev = maxRoundByBracket.get(row.bracketId) ?? 0;
+    if (!row.bracketId || !row.bracketSection || row.maxRound == null) continue;
+    const key = `${row.bracketId}:${row.bracketSection}`;
+    const prev = maxRoundByBracketSection.get(key) ?? 0;
     if (row.maxRound > prev) {
-      maxRoundByBracket.set(row.bracketId, row.maxRound);
+      maxRoundByBracketSection.set(key, row.maxRound);
     }
   }
 
@@ -279,9 +319,16 @@ export async function gatherPacketData(
       if (m.poolId) {
         roundLabel = poolNameById.get(m.poolId) ?? "Pool";
       } else if (m.bracketId && m.bracketRound != null) {
-        const maxRound = maxRoundByBracket.get(m.bracketId) ?? m.bracketRound;
+        const section = (m.bracketSection ?? "main") as BracketSection;
+        const maxRound =
+          maxRoundByBracketSection.get(`${m.bracketId}:${section}`) ??
+          m.bracketRound;
         const bracketName = bracketNameById.get(m.bracketId);
-        roundLabel = `${bracketName} · ${bracketRoundLabel(m.bracketRound, maxRound)}`;
+        roundLabel = `${bracketName} · ${formatBracketRoundLabel({
+          section,
+          round: m.bracketRound,
+          maxRound,
+        })}`;
       }
 
       const teamAName = m.teamAId
@@ -315,6 +362,9 @@ export async function gatherPacketData(
     playFormat === "pool_to_bracket" ||
     playFormat === "single_elimination" ||
     playFormat === "double_elimination";
+  const bracketMatchFormat = matchFormatForMatch(tournament.matchFormat, {
+    bracketId: "bracket",
+  });
 
   const tiebreakCriteria = (tournament.poolTiebreakCriteria ?? []).map((c) =>
     formatPoolTiebreakCriterionLabel(c as PoolTiebreakCriterion)
@@ -347,6 +397,7 @@ export async function gatherPacketData(
       name: r.teamName,
     })),
     playFormatLabel: formatPlayFormatLabel(playFormat),
+    hasPoolPlay: playFormat === "pool_to_bracket",
     poolRules: {
       matchFormat: tournament.matchFormat,
       matchFormatLabel: formatMatchFormatLabel(tournament.matchFormat),
@@ -358,12 +409,18 @@ export async function gatherPacketData(
     },
     bracketRules: hasBracketPlay
       ? {
-          summary: bracketTierSummary(
-            tournament.bracketCount ?? 1,
-            tournament.goldTeamCount,
-            tournament.silverTeamCount
-          ),
+          summary: formatBracketRulesSummary({
+            playFormat,
+            bracketCount: tournament.bracketCount ?? 1,
+            goldTeamCount: tournament.goldTeamCount,
+            silverTeamCount: tournament.silverTeamCount,
+          }),
           bracketCount: tournament.bracketCount ?? 1,
+          matchFormat: bracketMatchFormat,
+          matchFormatLabel: formatMatchFormatLabel(bracketMatchFormat),
+          setStartingScore: tournament.bracketSetStartingScore,
+          setTargetScore: tournament.setTargetScore,
+          tiebreakTargetScore: tournament.tiebreakTargetScore,
         }
       : null,
     schedule,

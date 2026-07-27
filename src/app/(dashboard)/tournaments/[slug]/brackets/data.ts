@@ -67,6 +67,7 @@ export type DivisionPlayData = {
     seedCount: number;
     name: string | null;
     tier: number;
+    topologyVersion: number;
     matches: {
       id: string;
       slug: string;
@@ -74,6 +75,8 @@ export type DivisionPlayData = {
       teamBId: string | null;
       teamAName: string | null;
       teamBName: string | null;
+      bracketSection: "main" | "winners" | "losers" | "grand_final";
+      bracketActivation: "required" | "conditional" | "not_required";
       bracketRound: number | null;
       bracketPosition: number | null;
       refTeamId: string | null;
@@ -356,6 +359,7 @@ export async function getDivisionPlayData(
       seedCount: bracket.seedCount,
       name: bracket.name,
       tier: bracket.tier,
+      topologyVersion: bracket.topologyVersion,
       matches: (matchesByBracket.get(bracket.id) ?? []).map((m) => ({
         id: m.id,
         slug: m.slug,
@@ -363,6 +367,10 @@ export async function getDivisionPlayData(
         teamBId: m.teamBId,
         teamAName: m.teamAId ? (bracketTeamName.get(m.teamAId) ?? null) : null,
         teamBName: m.teamBId ? (bracketTeamName.get(m.teamBId) ?? null) : null,
+        // The migration backfills every persisted bracket match. These
+        // fallbacks keep organizer pages readable during a rolling deploy.
+        bracketSection: m.bracketSection ?? "main",
+        bracketActivation: m.bracketActivation ?? "required",
         bracketRound: m.bracketRound,
         bracketPosition: m.bracketPosition,
         refTeamId: m.refTeamId,

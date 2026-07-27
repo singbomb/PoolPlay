@@ -17,6 +17,7 @@ BEGIN
     VALUES
       ('account_deletion_requests'),
       ('auth_rate_limits'),
+      ('bracket_match_edges'),
       ('brackets'),
       ('content_flags'),
       ('court_divisions'),
@@ -201,6 +202,8 @@ BEGIN
   FROM (
     VALUES
       ('auth_rate_limits_expiry_idx'),
+      ('bracket_match_edges_target_slot_unique'),
+      ('matches_id_bracket_unique'),
       ('matches_tournament_slug_unique'),
       ('matches_bracket_coordinate_unique'),
       ('match_score_events_match_revision_unique'),
@@ -226,10 +229,16 @@ BEGIN
   INTO missing_check_count
   FROM (
     VALUES
+      ('bracket_match_edges', 'bracket_match_edges_no_self_edge_check'),
+      ('brackets', 'brackets_topology_version_positive'),
       ('divisions', 'divisions_bracket_count_check'),
       ('match_score_events', 'match_score_events_event_type_check'),
       ('match_score_events', 'match_score_events_revision_positive'),
+      ('matches', 'matches_bracket_metadata_check'),
+      ('matches', 'matches_completed_bracket_winner_check'),
+      ('matches', 'matches_distinct_participants_check'),
       ('matches', 'matches_score_revision_nonnegative'),
+      ('matches', 'matches_winner_is_participant_check'),
       (
         'registration_payments',
         'registration_payments_amount_nonnegative'
@@ -346,6 +355,153 @@ BEGIN
 
   IF NOT EXISTS (
     SELECT 1
+    FROM pg_proc procedure
+    JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+    WHERE namespace.nspname = 'app_private'
+      AND procedure.proname = 'enforce_bracket_match_edge_acyclic'
+      AND pg_get_userbyid(procedure.proowner) = 'postgres'
+      AND NOT procedure.prosecdef
+      AND procedure.proconfig @> ARRAY['search_path=""']::text[]
+      AND NOT EXISTS (
+        SELECT 1
+        FROM aclexplode(
+          coalesce(
+            procedure.proacl,
+            acldefault('f', procedure.proowner)
+          )
+        ) privilege
+        WHERE privilege.grantee = 0
+          AND privilege.privilege_type = 'EXECUTE'
+      )
+      AND NOT has_function_privilege('anon', procedure.oid, 'EXECUTE')
+      AND NOT has_function_privilege(
+        'authenticated',
+        procedure.oid,
+        'EXECUTE'
+      )
+  ) THEN
+    RAISE EXCEPTION 'The bracket cycle guard is missing or unsafe';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_proc procedure
+    JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+    WHERE namespace.nspname = 'app_private'
+      AND procedure.proname = 'enforce_bracket_tournament_ownership'
+      AND pg_get_userbyid(procedure.proowner) = 'postgres'
+      AND NOT procedure.prosecdef
+      AND procedure.proconfig @> ARRAY['search_path=""']::text[]
+      AND NOT EXISTS (
+        SELECT 1
+        FROM aclexplode(
+          coalesce(
+            procedure.proacl,
+            acldefault('f', procedure.proowner)
+          )
+        ) privilege
+        WHERE privilege.grantee = 0
+          AND privilege.privilege_type = 'EXECUTE'
+      )
+      AND NOT has_function_privilege('anon', procedure.oid, 'EXECUTE')
+      AND NOT has_function_privilege(
+        'authenticated',
+        procedure.oid,
+        'EXECUTE'
+      )
+  ) THEN
+    RAISE EXCEPTION 'The bracket tournament ownership guard is missing or unsafe';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM (
+      VALUES
+        ('matches', 'matches_enforce_bracket_tournament'),
+        ('brackets', 'brackets_enforce_match_tournament'),
+        ('divisions', 'divisions_enforce_bracket_match_tournament')
+    ) AS expected(table_name, trigger_name)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_trigger trigger_row
+      JOIN pg_proc procedure ON procedure.oid = trigger_row.tgfoid
+      JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+      WHERE trigger_row.tgrelid = format(
+        'public.%I',
+        expected.table_name
+      )::regclass
+        AND trigger_row.tgname = expected.trigger_name
+        AND NOT trigger_row.tgisinternal
+        AND trigger_row.tgenabled = 'O'
+        AND namespace.nspname = 'app_private'
+        AND procedure.proname = 'enforce_bracket_tournament_ownership'
+    )
+  ) THEN
+    RAISE EXCEPTION 'A bracket tournament ownership trigger is missing or disabled';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM (
+      VALUES
+        ('matches', 'matches_validate_bracket_tournament'),
+        ('brackets', 'brackets_validate_match_tournament'),
+        ('divisions', 'divisions_validate_bracket_match_tournament')
+    ) AS expected(table_name, trigger_name)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_trigger trigger_row
+      JOIN pg_proc procedure ON procedure.oid = trigger_row.tgfoid
+      JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+      WHERE trigger_row.tgrelid = format(
+        'public.%I',
+        expected.table_name
+      )::regclass
+        AND trigger_row.tgname = expected.trigger_name
+        AND NOT trigger_row.tgisinternal
+        AND trigger_row.tgenabled = 'O'
+        AND trigger_row.tgconstraint <> 0
+        AND trigger_row.tgdeferrable
+        AND trigger_row.tginitdeferred
+        AND namespace.nspname = 'app_private'
+        AND procedure.proname = 'enforce_bracket_tournament_ownership'
+    )
+  ) THEN
+    RAISE EXCEPTION 'A deferred bracket ownership validation trigger is missing or changed';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_trigger trigger_row
+    JOIN pg_proc procedure ON procedure.oid = trigger_row.tgfoid
+    JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+    WHERE trigger_row.tgrelid =
+      'public.bracket_match_edges'::regclass
+      AND trigger_row.tgname = 'bracket_match_edges_serialize'
+      AND NOT trigger_row.tgisinternal
+      AND trigger_row.tgenabled = 'O'
+      AND trigger_row.tgconstraint = 0
+      AND trigger_row.tgtype = 31
+      AND namespace.nspname = 'app_private'
+      AND procedure.proname = 'enforce_bracket_match_edge_acyclic'
+  ) THEN
+    RAISE EXCEPTION 'The bracket edge serialization trigger is missing or changed';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_trigger trigger_row
+    WHERE trigger_row.tgrelid = 'public.bracket_match_edges'::regclass
+      AND trigger_row.tgname = 'bracket_match_edges_acyclic'
+      AND trigger_row.tgconstraint <> 0
+      AND trigger_row.tgdeferrable
+      AND trigger_row.tginitdeferred
+  ) THEN
+    RAISE EXCEPTION 'The deferred bracket cycle trigger is missing';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
     FROM pg_event_trigger
     WHERE evtname = 'ensure_rls'
       AND evtevent = 'ddl_command_end'
@@ -401,7 +557,10 @@ BEGIN
     FROM pg_publication_tables
     WHERE pubname = 'supabase_realtime'
       AND schemaname = 'public'
-  ) IS DISTINCT FROM ARRAY['tournament_chat_messages']::name[] THEN
+  ) IS DISTINCT FROM ARRAY[
+    'matches',
+    'tournament_chat_messages'
+  ]::name[] THEN
     RAISE EXCEPTION 'Unexpected Supabase Realtime publication membership';
   END IF;
 END;

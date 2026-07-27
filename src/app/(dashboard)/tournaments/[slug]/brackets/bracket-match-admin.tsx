@@ -37,6 +37,8 @@ import {
   type BracketMatchForRefs,
 } from "@/lib/tournaments/bracket-refs";
 import { isBracketRoundOneByeMatch } from "@/lib/utils/bracket";
+import type { MatchFormat } from "@/lib/labels/match-format";
+import { buildMatchScoreState } from "@/lib/tournaments/match-format";
 import { updateBracketMatchCourt, updateMatchRef } from "./actions";
 
 interface BracketMatchRow {
@@ -46,6 +48,8 @@ interface BracketMatchRow {
   teamBId: string | null;
   teamAName: string | null;
   teamBName: string | null;
+  bracketSection: "main" | "winners" | "losers" | "grand_final";
+  bracketActivation: "required" | "conditional" | "not_required";
   bracketRound: number | null;
   bracketPosition: number | null;
   refTeamId: string | null;
@@ -68,8 +72,31 @@ interface TeamLabel {
   label: string;
 }
 
+interface BracketScoreSettings {
+  format: MatchFormat;
+  targetScore: number;
+  tiebreakTargetScore: number;
+}
+
 const REF_NONE_VALUE = "";
 const COURT_NONE_VALUE = "";
+
+type BracketSection = BracketMatchRow["bracketSection"];
+
+interface BracketRoundGroup {
+  key: string;
+  section: BracketSection;
+  round: number;
+  totalRounds: number;
+  matches: BracketMatchRow[];
+}
+
+const BRACKET_SECTION_ORDER: Record<BracketSection, number> = {
+  main: 0,
+  winners: 1,
+  losers: 2,
+  grand_final: 3,
+};
 
 function roundLabel(round: number, totalRounds: number): string {
   if (round === totalRounds) return "Final";
@@ -78,18 +105,60 @@ function roundLabel(round: number, totalRounds: number): string {
   return `Round ${round}`;
 }
 
-function groupByRound(matches: BracketMatchRow[]): Map<number, BracketMatchRow[]> {
-  const map = new Map<number, BracketMatchRow[]>();
+function sectionRoundLabel(
+  section: BracketSection,
+  round: number,
+  totalRounds: number
+): string {
+  if (section === "grand_final") {
+    return round === 1 ? "Championship · Grand Final" : "Championship · Reset";
+  }
+  const label = roundLabel(round, totalRounds);
+  if (section === "winners") return `Winners · ${label}`;
+  if (section === "losers") return `Losers · ${label}`;
+  return label;
+}
+
+function groupBySectionAndRound(
+  matches: BracketMatchRow[],
+  allMatches: BracketMatchRow[]
+): BracketRoundGroup[] {
+  const map = new Map<string, BracketMatchRow[]>();
   for (const match of matches) {
     const round = match.bracketRound ?? 1;
-    const list = map.get(round) ?? [];
+    const key = `${match.bracketSection}:${round}`;
+    const list = map.get(key) ?? [];
     list.push(match);
-    map.set(round, list);
+    map.set(key, list);
   }
   for (const [, list] of map) {
     list.sort((a, b) => (a.bracketPosition ?? 0) - (b.bracketPosition ?? 0));
   }
-  return map;
+
+  const totalRoundsBySection = new Map<BracketSection, number>();
+  for (const match of allMatches) {
+    const round = match.bracketRound ?? 1;
+    totalRoundsBySection.set(
+      match.bracketSection,
+      Math.max(totalRoundsBySection.get(match.bracketSection) ?? 0, round)
+    );
+  }
+
+  return [...map.entries()]
+    .map(([key, roundMatches]) => ({
+      key,
+      section: roundMatches[0].bracketSection,
+      round: roundMatches[0].bracketRound ?? 1,
+      totalRounds:
+        totalRoundsBySection.get(roundMatches[0].bracketSection) ?? 1,
+      matches: roundMatches,
+    }))
+    .sort((a, b) => {
+      const sectionDifference =
+        BRACKET_SECTION_ORDER[a.section] - BRACKET_SECTION_ORDER[b.section];
+      if (sectionDifference !== 0) return sectionDifference;
+      return a.round - b.round;
+    });
 }
 
 export function BracketMatchAdmin({
@@ -100,6 +169,7 @@ export function BracketMatchAdmin({
   matches,
   courts,
   teamLabels,
+  scoreSettings,
 }: {
   tournamentId: string;
   slug: string;
@@ -108,6 +178,7 @@ export function BracketMatchAdmin({
   matches: BracketMatchRow[];
   courts: TournamentCourt[];
   teamLabels: TeamLabel[];
+  scoreSettings: BracketScoreSettings;
 }) {
   const router = useRouter();
   const [, startTransition] = useTransition();
@@ -122,17 +193,13 @@ export function BracketMatchAdmin({
     () => new Map()
   );
 
-  const totalRounds = useMemo(
-    () => Math.max(0, ...matches.map((m) => m.bracketRound ?? 0)),
-    [matches]
-  );
-
   const forRefs: BracketMatchForRefs[] = useMemo(
     () =>
       matches
         .filter((m) => m.bracketRound != null && m.bracketPosition != null)
         .map((m) => ({
           id: m.id,
+          bracketSection: m.bracketSection,
           bracketRound: m.bracketRound!,
           bracketPosition: m.bracketPosition!,
           teamAId: m.teamAId,
@@ -151,6 +218,7 @@ export function BracketMatchAdmin({
     (m) =>
       m.teamAId &&
       m.teamBId &&
+      m.bracketActivation === "required" &&
       !isBracketRoundOneByeMatch({
         teamAId: m.teamAId,
         teamBId: m.teamBId,
@@ -158,14 +226,12 @@ export function BracketMatchAdmin({
       })
   );
 
-  const rounds = useMemo(
-    () => groupByRound(playableMatches),
-    [playableMatches]
+  const roundGroups = useMemo(
+    () => groupBySectionAndRound(playableMatches, matches),
+    [playableMatches, matches]
   );
-
-  const sortedRoundNumbers = useMemo(
-    () => [...rounds.keys()].sort((a, b) => a - b),
-    [rounds]
+  const isDoubleElimination = matches.some(
+    (match) => match.bracketSection !== "main"
   );
 
   if (playableMatches.length === 0) return null;
@@ -245,18 +311,19 @@ export function BracketMatchAdmin({
           {bracketName} — schedule & refs
         </h3>
         <p className="mt-0.5 text-xs text-muted-foreground">
-          Round 1 refs: bye teams or later same-court matches · Later rounds:
-          previous-round losers
+          {isDoubleElimination
+            ? "Refs must be teams that have already been eliminated."
+            : "Round 1 refs: bye teams or later same-court matches · Later rounds: previous-round losers"}
         </p>
       </header>
 
       <div className="space-y-5 p-4 sm:p-5">
-        {sortedRoundNumbers.map((round) => {
-          const roundMatches = rounds.get(round) ?? [];
-          const isFinal = round === totalRounds;
-
+        {roundGroups.map((group) => {
+          const isFinal =
+            group.section === "grand_final" ||
+            group.round === group.totalRounds;
           return (
-            <div key={round} className="space-y-2.5">
+            <div key={group.key} className="space-y-2.5">
               <div className="flex items-center gap-3">
                 <span
                   className={cn(
@@ -266,17 +333,21 @@ export function BracketMatchAdmin({
                       : "bg-muted/80 text-foreground/80"
                   )}
                 >
-                  {roundLabel(round, totalRounds)}
+                  {sectionRoundLabel(
+                    group.section,
+                    group.round,
+                    group.totalRounds
+                  )}
                 </span>
                 <div className="h-px min-w-0 flex-1 bg-border/60" aria-hidden />
                 <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-                  {roundMatches.length} match
-                  {roundMatches.length === 1 ? "" : "es"}
+                  {group.matches.length} match
+                  {group.matches.length === 1 ? "" : "es"}
                 </span>
               </div>
 
               <div className="flex flex-wrap gap-3">
-                {roundMatches.map((match) => (
+                {group.matches.map((match) => (
                   <BracketMatchTile
                     key={match.id}
                     match={match}
@@ -289,6 +360,7 @@ export function BracketMatchAdmin({
                     courtId={effectiveCourtId(match)}
                     isUpdating={pendingMatchId === match.id}
                     error={errorByMatchId.get(match.id)}
+                    scoreSettings={scoreSettings}
                     onRefChange={handleRefChange}
                     onCourtChange={handleCourtChange}
                   />
@@ -313,6 +385,7 @@ function BracketMatchTile({
   courtId,
   isUpdating,
   error,
+  scoreSettings,
   onRefChange,
   onCourtChange,
 }: {
@@ -326,6 +399,7 @@ function BracketMatchTile({
   courtId: string | null;
   isUpdating: boolean;
   error?: string;
+  scoreSettings: BracketScoreSettings;
   onRefChange: (matchId: string, value: string) => void;
   onCourtChange: (matchId: string, value: string) => void;
 }) {
@@ -337,6 +411,7 @@ function BracketMatchTile({
   const complete = match.status === "completed";
   const aWon = complete && match.winnerId === match.teamAId;
   const bWon = complete && match.winnerId === match.teamBId;
+  const scoreState = buildMatchScoreState(scoreSettings, match.sets);
 
   return (
     <article
@@ -383,7 +458,7 @@ function BracketMatchTile({
           name={match.teamAName}
           won={aWon}
           lost={complete && !aWon && Boolean(match.winnerId)}
-          setsWon={countSetsWon(match.sets, "a")}
+          setsWon={scoreState.setsWonA}
         />
         <div className="my-1 flex items-center gap-2">
           <div className="h-px flex-1 bg-border/60" />
@@ -396,7 +471,7 @@ function BracketMatchTile({
           name={match.teamBName}
           won={bWon}
           lost={complete && !bWon && Boolean(match.winnerId)}
-          setsWon={countSetsWon(match.sets, "b")}
+          setsWon={scoreState.setsWonB}
         />
         {match.sets.length > 0 && (
           <p className="pt-1 text-center text-[10px] tabular-nums text-muted-foreground">
@@ -495,18 +570,6 @@ function BracketMatchTile({
       </div>
     </article>
   );
-}
-
-function countSetsWon(
-  sets: { teamAScore: number; teamBScore: number }[],
-  side: "a" | "b"
-): number {
-  let n = 0;
-  for (const s of sets) {
-    if (side === "a" && s.teamAScore > s.teamBScore) n++;
-    if (side === "b" && s.teamBScore > s.teamAScore) n++;
-  }
-  return n;
 }
 
 function MatchupLine({

@@ -26,6 +26,7 @@ import { gatherPacketData } from "@/lib/tournaments/packet-data";
 import { userCanDownloadTournamentPacket } from "@/lib/tournaments/packet-access";
 import { TournamentPacketDocument } from "@/lib/tournaments/packet-pdf";
 import { contentDispositionHeader } from "@/lib/security/content-disposition";
+import { resolveIsTournamentOrganizer } from "@/lib/tournaments/permissions";
 
 interface RouteContext {
   params: Promise<{ slug: string }>;
@@ -71,7 +72,9 @@ export async function GET(request: Request, context: RouteContext) {
     );
   }
 
-  const data = await gatherPacketData(tournament.id);
+  const data = await gatherPacketData(tournament.id, {
+    includeUnreleased: await resolveIsTournamentOrganizer(tournament, user),
+  });
   if (!data) {
     return NextResponse.json({ error: "Tournament not found" }, { status: 404 });
   }

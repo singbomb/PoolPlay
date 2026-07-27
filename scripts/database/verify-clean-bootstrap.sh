@@ -47,6 +47,9 @@ for attempt in {1..30}; do
   sleep 1
 done
 
+port_binding="$(docker port "${container_name}" 5432/tcp)"
+readonly port="${port_binding##*:}"
+
 docker exec "${container_name}" \
   psql --username postgres --dbname postgres --file \
   /workspace/scripts/database/supabase-compat.sql
@@ -70,6 +73,10 @@ docker exec "${container_name}" \
   psql --username postgres --dbname postgres --file \
   /workspace/scripts/database/verify-rls.sql
 
+cd "${repository_root}"
+POOLPLAY_BOOTSTRAP_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/postgres" \
+  node --import tsx scripts/database/verify-bracket-graph.ts
+
 echo "Catalog fingerprint:"
 catalog_fingerprint="$(docker exec "${container_name}" \
   psql --username postgres --dbname postgres \
@@ -84,10 +91,6 @@ if ! diff --unified "${expected_catalog}" <(
   exit 1
 fi
 
-port_binding="$(docker port "${container_name}" 5432/tcp)"
-readonly port="${port_binding##*:}"
-
-cd "${repository_root}"
 POOLPLAY_BOOTSTRAP_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/postgres" \
   node --import tsx scripts/database/verify-schema.ts
 
@@ -96,5 +99,8 @@ POOLPLAY_BOOTSTRAP_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/postgre
 
 POOLPLAY_BOOTSTRAP_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/postgres" \
   node --import tsx scripts/database/verify-registration-roster-concurrency.ts
+
+POOLPLAY_BOOTSTRAP_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/postgres" \
+  node --import tsx scripts/database/verify-double-elimination.ts
 
 echo "Clean database bootstrap verified."

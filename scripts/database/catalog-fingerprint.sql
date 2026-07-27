@@ -4,6 +4,7 @@ WITH app_tables(table_name) AS (
   VALUES
     ('account_deletion_requests'),
     ('auth_rate_limits'),
+    ('bracket_match_edges'),
     ('brackets'),
     ('content_flags'),
     ('court_divisions'),
@@ -179,7 +180,9 @@ functions_manifest AS (
     namespace.nspname = 'app_private'
     AND procedure.proname IN (
       'current_user_can_access_tournament_chat',
-      'current_user_can_view_match'
+      'current_user_can_view_match',
+      'enforce_bracket_match_edge_acyclic',
+      'enforce_bracket_tournament_ownership'
     )
   )
   OR (
@@ -187,6 +190,34 @@ functions_manifest AS (
     AND procedure.proname = 'rls_auto_enable'
   )
   ORDER BY namespace.nspname, procedure.proname
+),
+triggers_manifest AS (
+  SELECT concat_ws(
+    '|',
+    relation.relname,
+    trigger_row.tgname,
+    trigger_row.tgenabled,
+    trigger_row.tgtype,
+    procedure_namespace.nspname,
+    procedure.proname
+  ) AS value
+  FROM pg_trigger trigger_row
+  JOIN pg_class relation ON relation.oid = trigger_row.tgrelid
+  JOIN pg_proc procedure ON procedure.oid = trigger_row.tgfoid
+  JOIN pg_namespace procedure_namespace
+    ON procedure_namespace.oid = procedure.pronamespace
+  WHERE trigger_row.tgname IN (
+    'bracket_match_edges_acyclic',
+    'bracket_match_edges_serialize',
+    'brackets_enforce_match_tournament',
+    'brackets_validate_match_tournament',
+    'divisions_enforce_bracket_match_tournament',
+    'divisions_validate_bracket_match_tournament',
+    'matches_enforce_bracket_tournament',
+    'matches_validate_bracket_tournament'
+  )
+    AND NOT trigger_row.tgisinternal
+  ORDER BY relation.relname, trigger_row.tgname
 ),
 event_triggers_manifest AS (
   SELECT concat_ws(
@@ -299,6 +330,12 @@ fingerprints AS (
     count(*),
     md5(coalesce(string_agg(value, E'\n'), ''))
   FROM storage_manifest
+  UNION ALL
+  SELECT
+    'triggers',
+    count(*),
+    md5(coalesce(string_agg(value, E'\n'), ''))
+  FROM triggers_manifest
 )
 SELECT section, row_count, fingerprint
 FROM fingerprints

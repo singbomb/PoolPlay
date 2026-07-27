@@ -30,6 +30,7 @@ import {
   assertParticipantWinner,
 } from "@/lib/tournaments/competition-operation-rules";
 import { tryCompleteTournamentWhenBracketsDone } from "@/lib/tournaments/tournament-completion";
+import { matchFormatForMatch } from "@/lib/tournaments/match-format";
 
 export type DbClient = typeof db;
 export type MatchStatus = "upcoming" | "in_progress" | "completed";
@@ -43,6 +44,7 @@ export type LockedMatch = {
   poolId: string | null;
   divisionId: string | null;
   bracketId: string | null;
+  bracketActivation: "required" | "conditional" | "not_required" | null;
   bracketRound: number | null;
   bracketPosition: number | null;
   teamAId: string | null;
@@ -116,6 +118,7 @@ export async function loadLockedMatch(
       poolId: matches.poolId,
       divisionId: pools.divisionId,
       bracketId: matches.bracketId,
+      bracketActivation: matches.bracketActivation,
       bracketRound: matches.bracketRound,
       bracketPosition: matches.bracketPosition,
       teamAId: matches.teamAId,
@@ -136,7 +139,10 @@ export async function loadLockedMatch(
     .where(eq(matches.id, matchId))
     .limit(1);
   if (!row) throw new OperationValidationError("Match not found.");
-  return row;
+  return {
+    ...row,
+    matchFormat: matchFormatForMatch(row.matchFormat, row),
+  };
 }
 
 async function actorIsCurrentOrganizer(
@@ -247,6 +253,20 @@ export async function insertScoreEvent(
 
 export type MatchLifecycleAction = "warmup" | "start" | "pause";
 
+export function assertLockedMatchIsPlayable(match: LockedMatch): void {
+  if (!match.bracketId) return;
+  if (match.bracketActivation !== "required") {
+    throw new OperationValidationError(
+      "This bracket match is not active for play."
+    );
+  }
+  if (!match.teamAId || !match.teamBId) {
+    throw new OperationValidationError(
+      "Both teams must be assigned before this bracket match can be changed."
+    );
+  }
+}
+
 type MatchLifecycleInput = {
   matchId: string;
   action: MatchLifecycleAction;
@@ -265,6 +285,7 @@ function assertLifecycleTransition(
   input: MatchLifecycleInput
 ): void {
   assertExpectedRevision(match.scoreRevision, input.expectedRevision);
+  assertLockedMatchIsPlayable(match);
   if (match.tournamentStatus !== "in_progress") {
     throw new OperationValidationError(
       "Match lifecycle can only change while the tournament is in progress."
@@ -437,6 +458,7 @@ export async function finalizeLockedMatch(
   actorUserId: string,
   executor: DbClient
 ): Promise<number> {
+  assertLockedMatchIsPlayable(match);
   assertParticipantWinner(
     winnerId,
     match.teamAId,

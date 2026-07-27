@@ -33,7 +33,7 @@ import {
   pools,
   brackets,
 } from "@/lib/db/schema";
-import { eq, and, ne, inArray, or, count } from "drizzle-orm";
+import { eq, and, ne, inArray, or } from "drizzle-orm";
 import { requireUser, isAdmin } from "@/lib/auth";
 import {
   createTournamentSchema,
@@ -61,6 +61,13 @@ import {
   ensureDivisionAutoPool,
 } from "@/lib/tournaments/division-pools";
 import { ensureDivisionBracketSkeleton } from "@/lib/tournaments/bracket-structure";
+import { releaseDivisionPlay } from "@/lib/tournaments/division-release";
+import { loadLockedTournamentForOrganizer } from "@/lib/tournaments/locked-tournament-authorization";
+import {
+  straightEliminationDivisionsMissingChampions,
+  straightEliminationDivisionsMissingSeeds,
+  tournamentHasIncompleteActiveBrackets,
+} from "@/lib/tournaments/tournament-completion";
 import { assertChildBelongsToAuthorizedParent } from "@/lib/security/authorization-invariants";
 import { transitionRegistrationStatuses } from "@/lib/tournaments/registration-transitions";
 import {
@@ -72,10 +79,7 @@ import {
   OperationConflictError,
   OperationValidationError,
 } from "@/lib/tournaments/competition-operation-rules";
-import {
-  DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE,
-  isCreatablePlayFormat,
-} from "@/lib/labels/play-format";
+import { isCreatablePlayFormat } from "@/lib/labels/play-format";
 import type { TournamentStatus } from "@/types";
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -99,10 +103,7 @@ export async function createTournament(formData: FormData) {
     formData.get("playFormat") || "pool_to_bracket";
   if (!isCreatablePlayFormat(requestedPlayFormat)) {
     return {
-      error:
-        requestedPlayFormat === "double_elimination"
-          ? DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE
-          : "Choose a supported tournament format",
+      error: "Choose a supported tournament format",
     };
   }
 
@@ -570,25 +571,6 @@ export async function updateTournamentStatus(
 ) {
   const user = await requireUser();
 
-  const [tournament] = await db
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, tournamentId))
-    .limit(1);
-
-  if (!tournament || !await resolveIsTournamentOrganizer(tournament, user)) {
-    return { error: "Only the organizer can update tournament status" };
-  }
-
-  // Past-date tournaments are archived; status is read-only until the
-  // organizer pushes the date forward via updateTournamentDate.
-  if (isTournamentArchived(tournament.date)) {
-    return {
-      error:
-        "This tournament is archived (past its date). Update the date first to change status.",
-    };
-  }
-
   const allowed: TournamentStatus[] = [
     "draft",
     "registration_open",
@@ -600,10 +582,77 @@ export async function updateTournamentStatus(
     return { error: "Invalid tournament status" };
   }
 
-  await db
-    .update(tournaments)
-    .set({ status, updatedAt: new Date() })
-    .where(eq(tournaments.id, tournamentId));
+  try {
+    const result = await db.transaction(async (tx) => {
+      const executor = tx as unknown as typeof db;
+      const tournament = await loadLockedTournamentForOrganizer(
+        tournamentId,
+        user.id,
+        executor
+      );
+      if (!tournament) {
+        return { error: "Only the organizer can update tournament status" };
+      }
+
+      // Past-date tournaments are archived; status is read-only until the
+      // organizer pushes the date forward via updateTournamentDate.
+      if (isTournamentArchived(tournament.date)) {
+        return {
+          error:
+            "This tournament is archived (past its date). Update the date first to change status.",
+        };
+      }
+
+      if (status === "in_progress") {
+        const missingSeeds = await straightEliminationDivisionsMissingSeeds(
+          tournamentId,
+          executor
+        );
+        if (missingSeeds.length > 0) {
+          return {
+            error: `Seed the elimination bracket for ${missingSeeds.join(
+              ", "
+            )} before starting the tournament.`,
+          };
+        }
+      }
+      if (status === "completed") {
+        const missingChampions =
+          await straightEliminationDivisionsMissingChampions(
+            tournamentId,
+            executor
+          );
+        if (missingChampions.length > 0) {
+          return {
+            error: `Finish the elimination bracket for ${missingChampions.join(
+              ", "
+            )} before completing the tournament.`,
+          };
+        }
+        if (
+          await tournamentHasIncompleteActiveBrackets(
+            tournamentId,
+            executor
+          )
+        ) {
+          return {
+            error:
+              "Finish every active elimination bracket before completing the tournament.",
+          };
+        }
+      }
+
+      await executor
+        .update(tournaments)
+        .set({ status, updatedAt: new Date() })
+        .where(eq(tournaments.id, tournamentId));
+      return { success: true as const };
+    });
+    if ("error" in result) return result;
+  } catch (error) {
+    console.error("Could not update tournament status", error);
+    return { error: "Could not update tournament status" };
+  }
 
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
@@ -669,8 +718,7 @@ export async function addDivision(tournamentId: string, formData: FormData) {
   }
   if (!isCreatablePlayFormat(tournament.playFormat)) {
     return {
-      error:
-        "New pools cannot be added to a legacy double-elimination tournament.",
+      error: "The tournament format is not supported.",
     };
   }
 
@@ -750,68 +798,48 @@ export async function removeDivision(tournamentId: string, divisionId: string) {
   return { success: true };
 }
 
-/** Make pool play and brackets visible to all tournament viewers. */
+/** Make a division's generated pool or bracket play visible to all viewers. */
 export async function releaseDivisionPools(
   tournamentId: string,
   divisionId: string
 ) {
   const user = await requireUser();
+  try {
+    const result = await db.transaction(async (tx) => {
+      const executor = tx as unknown as typeof db;
+      const tournament = await loadLockedTournamentForOrganizer(
+        tournamentId,
+        user.id,
+        executor
+      );
+      if (!tournament) {
+        return {
+          error: "Only the tournament host can release this division",
+        };
+      }
+      return releaseDivisionPlay(
+        { tournamentId, divisionId },
+        executor
+      );
+    });
+    if ("error" in result) return { error: result.error };
 
-  const [tournament] = await db
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, tournamentId))
-    .limit(1);
-
-  if (!tournament || !await resolveIsTournamentOrganizer(tournament, user)) {
-    return { error: "Only the tournament host can release pools" };
-  }
-
-  const [division] = await db
-    .select()
-    .from(divisions)
-    .where(eq(divisions.id, divisionId))
-    .limit(1);
-
-  if (!division || division.tournamentId !== tournamentId) {
-    return { error: "Pool not found" };
-  }
-
-  if (division.poolsReleasedAt) {
-    return { success: true as const, alreadyReleased: true as const };
-  }
-
-  const poolRows = await db
-    .select({ id: pools.id })
-    .from(pools)
-    .where(eq(pools.divisionId, divisionId))
-    .limit(1);
-
-  const poolId = poolRows[0]?.id;
-  if (!poolId) {
-    return { error: "Set up pool matches before releasing" };
-  }
-
-  const [{ value: matchCount }] = await db
-    .select({ value: count() })
-    .from(matches)
-    .where(eq(matches.poolId, poolId));
-
-  if ((matchCount ?? 0) === 0) {
+    revalidatePath("/tournaments/[slug]", "page");
+    revalidatePath("/tournaments/[slug]/scoring", "page");
     return {
-      error:
-        "Save seeding and generate pool matches on the Pools tab before releasing",
+      success: true as const,
+      alreadyReleased: result.alreadyReleased,
     };
+  } catch (error) {
+    if (
+      error instanceof OperationConflictError ||
+      error instanceof OperationValidationError
+    ) {
+      return { error: error.message };
+    }
+    console.error("Could not release division", error);
+    return { error: "Could not release this division. Try again." };
   }
-
-  await db
-    .update(divisions)
-    .set({ poolsReleasedAt: new Date() })
-    .where(eq(divisions.id, divisionId));
-
-  revalidatePath("/tournaments/[slug]", "page");
-  revalidatePath("/tournaments/[slug]/scoring", "page");
-  return { success: true as const };
 }
 
 export async function addCourt(tournamentId: string, formData: FormData) {

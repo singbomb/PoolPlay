@@ -1,48 +1,74 @@
-/*
- * PoolPlay - Collegiate club volleyball tournament hub
- * Copyright (C) 2026 Andrew Chang
- * 
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- * 
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- * 
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
-
-import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { setStartingScoreForMatch } from "./match-format";
+import { describe, it } from "node:test";
+import {
+  buildMatchScoreState,
+  evaluateMatchOutcome,
+  matchFormatForMatch,
+} from "./match-format";
 
-describe("setStartingScoreForMatch", () => {
-  const tournament = {
-    setStartingScore: 4,
-    bracketSetStartingScore: 0,
-  };
-
-  it("uses pool starting score for pool matches", () => {
+describe("matchFormatForMatch", () => {
+  it("keeps best-of-two ties for pool matches", () => {
     assert.equal(
-      setStartingScoreForMatch(tournament, {
-        poolId: "pool-1",
-        bracketId: null,
-      }),
-      4
+      matchFormatForMatch("best_of_2", { bracketId: null }),
+      "best_of_2"
     );
   });
 
-  it("uses bracket starting score for bracket matches", () => {
-    assert.equal(
-      setStartingScoreForMatch(tournament, {
-        poolId: null,
-        bracketId: "bracket-1",
-      }),
-      0
+  it("adds a deciding tiebreak for elimination matches", () => {
+    const format = matchFormatForMatch("best_of_2", {
+      bracketId: "bracket-1",
+    });
+    assert.equal(format, "two_with_tiebreak");
+
+    const split = evaluateMatchOutcome(
+      { format },
+      "team-a",
+      "team-b",
+      [
+        { teamAScore: 25, teamBScore: 20 },
+        { teamAScore: 20, teamBScore: 25 },
+      ]
     );
+    assert.equal(split.shouldFinalize, false);
+
+    const decided = evaluateMatchOutcome(
+      { format },
+      "team-a",
+      "team-b",
+      [
+        { teamAScore: 25, teamBScore: 20 },
+        { teamAScore: 20, teamBScore: 25 },
+        { teamAScore: 15, teamBScore: 10 },
+      ]
+    );
+    assert.equal(decided.winnerId, "team-a");
+    assert.equal(decided.shouldFinalize, true);
+  });
+
+  it("counts only completed sets in bracket score summaries", () => {
+    const partial = buildMatchScoreState(
+      {
+        format: "two_with_tiebreak",
+        targetScore: 25,
+        tiebreakTargetScore: 15,
+      },
+      [
+        { teamAScore: 25, teamBScore: 20 },
+        { teamAScore: 24, teamBScore: 23 },
+      ]
+    );
+    assert.equal(partial.setsWonA, 1);
+    assert.equal(partial.setsWonB, 0);
+
+    const deuce = buildMatchScoreState(
+      {
+        format: "two_with_tiebreak",
+        targetScore: 25,
+        tiebreakTargetScore: 15,
+      },
+      [{ teamAScore: 26, teamBScore: 25 }]
+    );
+    assert.equal(deuce.setsWonA, 0);
+    assert.equal(deuce.setsWonB, 0);
   });
 });

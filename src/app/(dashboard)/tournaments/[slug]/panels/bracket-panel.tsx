@@ -18,22 +18,33 @@
 
 import { Trophy } from "lucide-react";
 import type { InferSelectModel } from "drizzle-orm";
-import { asc, eq, and, inArray } from "drizzle-orm";
+import { asc, count, eq, and, inArray } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { divisions, tournaments, courts, teams, registrations } from "@/lib/db/schema";
+import {
+  divisions,
+  tournaments,
+  courts,
+  teams,
+  registrations,
+} from "@/lib/db/schema";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
+  canAssignTeamsToPools,
   resolveIsTournamentOrganizer,
   type UserForPermissions,
 } from "@/lib/tournaments/permissions";
 import { tournamentCombinedBracketsRegenerateState } from "@/lib/tournaments/bracket-structure";
 import { getDivisionPlayData } from "../brackets/data";
 import { BracketView } from "../brackets/bracket-view";
+import { DoubleEliminationBracketView } from "../brackets/double-elimination-bracket-view";
 import { BracketMatchAdmin } from "../brackets/bracket-match-admin";
 import { BracketSeedingTable } from "../brackets/bracket-seeding-table";
 import { BracketSettingsPanel } from "../brackets/bracket-settings-panel";
+import { DivisionPoolRelease } from "../brackets/division-pool-release";
+import { PoolSeedingPanel } from "../brackets/pool-seeding-panel";
 import { buildBracketSeedingReport } from "@/lib/tournaments/combined-bracket-standings";
+import { matchFormatForMatch } from "@/lib/tournaments/match-format";
 
 export async function TournamentBracketPanel({
   tournament,
@@ -59,28 +70,43 @@ export async function TournamentBracketPanel({
     (d) => d.format === "pool_to_bracket"
   );
 
-  const [tournamentCourts, registeredTeams] = await Promise.all([
-    db
-      .select({ id: courts.id, name: courts.name })
-      .from(courts)
-      .where(eq(courts.tournamentId, tournament.id))
-      .orderBy(asc(courts.name), asc(courts.id)),
-    db
-      .select({
-        id: teams.id,
-        name: teams.name,
-        university: teams.university,
-      })
-      .from(registrations)
-      .innerJoin(teams, eq(registrations.teamId, teams.id))
-      .where(
-        and(
-          eq(registrations.tournamentId, tournament.id),
-          inArray(registrations.status, ["confirmed", "checked_in"])
+  const [tournamentCourts, registeredTeams, pendingCountRow] =
+    await Promise.all([
+      db
+        .select({ id: courts.id, name: courts.name })
+        .from(courts)
+        .where(eq(courts.tournamentId, tournament.id))
+        .orderBy(asc(courts.name), asc(courts.id)),
+      db
+        .select({
+          id: teams.id,
+          name: teams.name,
+          university: teams.university,
+        })
+        .from(registrations)
+        .innerJoin(teams, eq(registrations.teamId, teams.id))
+        .where(
+          and(
+            eq(registrations.tournamentId, tournament.id),
+            inArray(registrations.status, ["confirmed", "checked_in"])
+          )
         )
-      )
-      .orderBy(asc(teams.name)),
-  ]);
+        .orderBy(asc(teams.name)),
+      db
+        .select({ value: count() })
+        .from(registrations)
+        .where(
+          and(
+            eq(registrations.tournamentId, tournament.id),
+            eq(registrations.status, "pending")
+          )
+        ),
+    ]);
+  const canSeedStraightElimination = await canAssignTeamsToPools(
+    tournament,
+    user,
+    pendingCountRow[0]?.value ?? 0
+  );
 
   const playData = await getDivisionPlayData(tournament.id, {
     forOrganizer: isOrganizer,
@@ -157,6 +183,13 @@ export async function TournamentBracketPanel({
       : null;
 
   const showBracketTiers = (tournament.bracketCount ?? 1) > 1;
+  const bracketScoreSettings = {
+    format: matchFormatForMatch(tournament.matchFormat, {
+      bracketId: "bracket",
+    }),
+    targetScore: tournament.setTargetScore,
+    tiebreakTargetScore: tournament.tiebreakTargetScore,
+  };
 
   return (
     <div className="space-y-6">
@@ -203,7 +236,15 @@ export async function TournamentBracketPanel({
                 <div className="space-y-4">
                   {combinedBrackets.map((bracket) => (
                     <div key={bracket.id} className="space-y-4">
-                      <BracketView bracket={bracket} slug={tournament.slug} />
+                      {bracket.bracketType === "double_elimination" ? (
+                        <DoubleEliminationBracketView
+                          bracket={bracket}
+                          slug={tournament.slug}
+                          scoreSettings={bracketScoreSettings}
+                        />
+                      ) : (
+                        <BracketView bracket={bracket} slug={tournament.slug} />
+                      )}
                       {isOrganizer && (
                         <BracketMatchAdmin
                           tournamentId={tournament.id}
@@ -213,6 +254,7 @@ export async function TournamentBracketPanel({
                           matches={bracket.matches}
                           courts={tournamentCourts}
                           teamLabels={teamLabels}
+                          scoreSettings={bracketScoreSettings}
                         />
                       )}
                     </div>
@@ -233,45 +275,100 @@ export async function TournamentBracketPanel({
                   ))}
                 </TabsList>
               )}
-              {otherEligible.map((div) => (
-                <TabsContent
-                  key={div.id}
-                  value={div.id}
-                  className="mt-4 space-y-4"
-                >
-                  {div.brackets.length === 0 ? (
-                    <EmptyState
-                      icon={Trophy}
-                      title="No bracket for this division yet"
-                      description="Add the division again in Setup if this persists."
-                    />
-                  ) : (
-                    <div className="space-y-4">
-                      {div.brackets.map((bracket) => (
-                        <div key={bracket.id} className="space-y-4">
-                          <BracketView
-                            bracket={bracket}
-                            slug={tournament.slug}
-                          />
-                          {isOrganizer && (
-                            <BracketMatchAdmin
-                              tournamentId={tournament.id}
-                              slug={tournament.slug}
-                              tournamentDate={tournament.date}
-                              bracketName={
-                                bracket.name ?? `${div.name} bracket`
-                              }
-                              matches={bracket.matches}
-                              courts={tournamentCourts}
-                              teamLabels={teamLabels}
-                            />
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </TabsContent>
-              ))}
+              {otherEligible.map((div) => {
+                const autoPool = div.pools[0] ?? null;
+                const seededBrackets = div.brackets.filter(
+                  (bracket) => bracket.seedCount >= 2
+                );
+                const bracketMatches = seededBrackets.flatMap(
+                  (bracket) => bracket.matches
+                );
+                const bracketPlayStarted = bracketMatches.some(
+                  (match) =>
+                    match.status === "in_progress" ||
+                    (match.status === "completed" &&
+                      match.teamAId !== null &&
+                      match.teamBId !== null)
+                );
+
+                return (
+                  <TabsContent
+                    key={div.id}
+                    value={div.id}
+                    className="mt-4 space-y-4"
+                  >
+                    {isOrganizer && autoPool ? (
+                      <PoolSeedingPanel
+                        key={`${autoPool.id}-${autoPool.teams
+                          .map((team) => team.id)
+                          .join(",")}`}
+                        tournamentId={tournament.id}
+                        poolId={autoPool.id}
+                        poolName={div.name}
+                        teams={autoPool.teams}
+                        canEdit={canSeedStraightElimination}
+                        matchesStarted={bracketPlayStarted}
+                        mode="elimination"
+                      />
+                    ) : null}
+                    {isOrganizer ? (
+                      <DivisionPoolRelease
+                        tournamentId={tournament.id}
+                        divisionId={div.id}
+                        divisionName={div.name}
+                        poolsReleasedAt={div.poolsReleasedAt}
+                        matchCount={bracketMatches.length}
+                        completedMatchCount={
+                          bracketMatches.filter(
+                            (match) => match.status === "completed"
+                          ).length
+                        }
+                        kind="bracket"
+                      />
+                    ) : null}
+                    {div.brackets.length === 0 ? (
+                      <EmptyState
+                        icon={Trophy}
+                        title="No bracket for this division yet"
+                        description="Add the division again in Setup if this persists."
+                      />
+                    ) : (
+                      <div className="space-y-4">
+                        {div.brackets.map((bracket) => (
+                          <div key={bracket.id} className="space-y-4">
+                            {bracket.bracketType === "double_elimination" ? (
+                              <DoubleEliminationBracketView
+                                bracket={bracket}
+                                slug={tournament.slug}
+                                scoreSettings={bracketScoreSettings}
+                              />
+                            ) : (
+                              <BracketView
+                                bracket={bracket}
+                                slug={tournament.slug}
+                              />
+                            )}
+                            {isOrganizer && (
+                              <BracketMatchAdmin
+                                tournamentId={tournament.id}
+                                slug={tournament.slug}
+                                tournamentDate={tournament.date}
+                                bracketName={
+                                  bracket.name ?? `${div.name} bracket`
+                                }
+                                matches={bracket.matches}
+                                courts={tournamentCourts}
+                                teamLabels={teamLabels}
+                                scoreSettings={bracketScoreSettings}
+                              />
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </TabsContent>
+                );
+              })}
             </Tabs>
           )}
         </>

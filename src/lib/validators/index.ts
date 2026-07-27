@@ -118,7 +118,7 @@ export const createTournamentSchema = z.object({
   location: z.string().min(1, "Location is required"),
   address: z.string().optional(),
   playFormat: z.enum(CREATABLE_PLAY_FORMATS, {
-    message: "Choose pool-to-bracket or single elimination",
+    message: "Choose a supported tournament format",
   }),
 });
 

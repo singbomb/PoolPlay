@@ -19,7 +19,7 @@
 import { notFound, redirect } from "next/navigation";
 import { getCurrentUser } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { divisions, sets, teams, courts, teamMembers, tournaments } from "@/lib/db/schema";
+import { divisions, sets, teams, courts, teamMembers } from "@/lib/db/schema";
 import { asc, eq } from "drizzle-orm";
 import { BackLink } from "@/components/layout/back-link";
 import { getTournamentBySlugIfVisible } from "@/lib/tournaments/access";
@@ -34,13 +34,17 @@ import {
   getMatchDivisionIdMap,
 } from "@/lib/tournaments/unreleased-divisions";
 import { isBracketRoundOneByeMatch, byeWinnerId } from "@/lib/utils/bracket";
-import { setStartingScoreForMatch } from "@/lib/tournaments/match-format";
+import {
+  matchFormatForMatch,
+  setStartingScoreForMatch,
+} from "@/lib/tournaments/match-format";
 import { tournamentTabUrl } from "../../constants";
 import { ByeMatchNotice } from "./bye-match-notice";
 import { MatchConsole } from "./match-console";
 import type { Metadata } from "next";
 import { getTournamentNameBySlug } from "@/lib/tournaments/metadata";
 import { pageMetadata, pageTitle } from "@/lib/metadata";
+import { formatBracketRoundLabel } from "@/lib/tournaments/bracket-labels";
 
 interface Props {
   params: Promise<{ slug: string; matchSlug: string }>;
@@ -49,31 +53,10 @@ interface Props {
 export async function generateMetadata({
   params,
 }: Pick<Props, "params">): Promise<Metadata> {
-  const { slug, matchSlug: rawMatchSlug } = await params;
-  const matchSlug = decodeURIComponent(rawMatchSlug).trim();
+  const { slug } = await params;
   const tournamentName = await getTournamentNameBySlug(slug);
   if (!tournamentName) return pageMetadata("Match");
-
-  const [tournament] = await db
-    .select({ id: tournaments.id })
-    .from(tournaments)
-    .where(eq(tournaments.slug, slug))
-    .limit(1);
-  if (!tournament) return pageMetadata(pageTitle("Match", tournamentName));
-
-  const match = await resolveMatchInTournament(tournament.id, matchSlug);
-  if (!match) return pageMetadata(pageTitle("Match", tournamentName));
-
-  const [teamA, teamB] = await Promise.all([
-    loadTeam(match.teamAId),
-    loadTeam(match.teamBId),
-  ]);
-  const matchup =
-    teamA?.name && teamB?.name
-      ? `${teamA.name} vs ${teamB.name}`
-      : teamA?.name ?? teamB?.name ?? "Match";
-
-  return pageMetadata(pageTitle(matchup, tournamentName));
+  return pageMetadata(pageTitle("Match", tournamentName));
 }
 
 async function loadTeam(teamId: string | null) {
@@ -97,11 +80,7 @@ export default async function MatchPage({ params }: Props) {
 
   const match = await resolveMatchInTournament(tournament.id, matchSlug);
   if (!match) notFound();
-
-  // Canonicalize legacy UUID links to the readable slug URL.
-  if (isUuid(matchSlug) && match.slug !== matchSlug) {
-    redirect(`/tournaments/${slug}/matches/${match.slug}`);
-  }
+  if (match.bracketId && match.bracketActivation !== "required") notFound();
 
   const isOrganizer = await resolveIsTournamentOrganizer(tournament, user);
 
@@ -122,6 +101,12 @@ export default async function MatchPage({ params }: Props) {
     ) {
       notFound();
     }
+  }
+
+  // Canonicalize only after publication access is established because the
+  // readable slug can contain unreleased team names.
+  if (isUuid(matchSlug) && match.slug !== matchSlug) {
+    redirect(`/tournaments/${slug}/matches/${match.slug}`);
   }
 
   const [teamA, teamB, refTeam, courtRow, matchSets, memberRows] =
@@ -158,7 +143,14 @@ export default async function MatchPage({ params }: Props) {
     match.refTeamId != null &&
     userTeamIds.has(match.refTeamId);
 
-  const isBye = isBracketRoundOneByeMatch(match);
+  const isBye =
+    isBracketRoundOneByeMatch(match) ||
+    Boolean(
+      match.bracketId &&
+        match.status === "completed" &&
+        match.winnerId &&
+        Boolean(match.teamAId) !== Boolean(match.teamBId)
+    );
 
   const backHref =
     match.poolId && divisionId
@@ -216,10 +208,17 @@ export default async function MatchPage({ params }: Props) {
           teamB,
           refTeamName: refTeam?.name ?? null,
           courtName: courtRow[0]?.name ?? null,
+          contextLabel:
+            match.bracketId && match.bracketRound
+              ? formatBracketRoundLabel({
+                  section: match.bracketSection ?? "main",
+                  round: match.bracketRound,
+                })
+              : null,
           sets: matchSets,
         }}
         settings={{
-          matchFormat: tournament.matchFormat,
+          matchFormat: matchFormatForMatch(tournament.matchFormat, match),
           setStartingScore: setStartingScoreForMatch(tournament, match),
           setTargetScore: tournament.setTargetScore,
           tiebreakTargetScore: tournament.tiebreakTargetScore,

@@ -177,32 +177,41 @@ export function TournamentPacketDocument({ data }: { data: PacketData }) {
           </Section>
         ) : null}
 
-        <Section title="Competition rules — pool play">
-          <Bullet>Format: {data.playFormatLabel}</Bullet>
-          <Bullet>Match format: {data.poolRules.matchFormatLabel}</Bullet>
-          <Bullet>
-            Pool sets start at {data.poolRules.setStartingScore}–
-            {data.poolRules.setStartingScore}, play to{" "}
-            {data.poolRules.setTargetScore}
-            {data.poolRules.matchFormat === "two_with_tiebreak"
-              ? ` (tiebreak to ${data.poolRules.tiebreakTargetScore})`
-              : ""}
-          </Bullet>
-          <Bullet>Warmup: {data.poolRules.warmupFormatLabel}</Bullet>
-          {data.poolRules.tiebreakCriteria.length > 0 ? (
-            <Text style={styles.paragraph}>
-              Pool standings tiebreaks (in order):{" "}
-              {data.poolRules.tiebreakCriteria.join(" → ")}
-            </Text>
-          ) : null}
-        </Section>
+        {data.hasPoolPlay ? (
+          <Section title="Competition rules — pool play">
+            <Bullet>Format: {data.playFormatLabel}</Bullet>
+            <Bullet>Match format: {data.poolRules.matchFormatLabel}</Bullet>
+            <Bullet>
+              Pool sets start at {data.poolRules.setStartingScore}–
+              {data.poolRules.setStartingScore}, play to{" "}
+              {data.poolRules.setTargetScore}
+              {data.poolRules.matchFormat === "two_with_tiebreak"
+                ? ` (tiebreak to ${data.poolRules.tiebreakTargetScore})`
+                : ""}
+            </Bullet>
+            <Bullet>Warmup: {data.poolRules.warmupFormatLabel}</Bullet>
+            {data.poolRules.tiebreakCriteria.length > 0 ? (
+              <Text style={styles.paragraph}>
+                Pool standings tiebreaks (in order):{" "}
+                {data.poolRules.tiebreakCriteria.join(" → ")}
+              </Text>
+            ) : null}
+          </Section>
+        ) : null}
 
         {data.bracketRules ? (
           <Section title="Competition rules — bracket play">
             <Text style={styles.paragraph}>{data.bracketRules.summary}</Text>
             <Bullet>
-              Match format: {data.poolRules.matchFormatLabel} (same as pool
-              play)
+              Match format: {data.bracketRules.matchFormatLabel}
+            </Bullet>
+            <Bullet>
+              Bracket sets start at {data.bracketRules.setStartingScore}–
+              {data.bracketRules.setStartingScore}, play to{" "}
+              {data.bracketRules.setTargetScore}
+              {data.bracketRules.matchFormat === "two_with_tiebreak"
+                ? ` (deciding set to ${data.bracketRules.tiebreakTargetScore})`
+                : ""}
             </Bullet>
             <Bullet>Warmup: {data.poolRules.warmupFormatLabel}</Bullet>
           </Section>

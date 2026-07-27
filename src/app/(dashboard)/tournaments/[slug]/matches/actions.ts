@@ -25,7 +25,7 @@ import {
   teamMembers,
   tournaments,
 } from "@/lib/db/schema";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { requireUser } from "@/lib/auth";
 import { updateScoreSchema } from "@/lib/validators";
 import {
@@ -46,9 +46,11 @@ import {
 } from "@/lib/tournaments/competition-operation-rules";
 import { transitionMatchLifecycleTransactional } from "@/lib/tournaments/score-operation-support";
 import { isTournamentArchived } from "@/lib/tournament-status";
+import { loadLockedTournamentForOrganizer } from "@/lib/tournaments/locked-tournament-authorization";
 
 type MatchRow = typeof matches.$inferSelect;
 type TournamentRow = typeof tournaments.$inferSelect;
+type MatchActionDbClient = typeof db;
 
 interface ControlGate {
   error: string | null;
@@ -294,21 +296,6 @@ export async function updateMatchScheduledTime(
   isoTime: string | null
 ) {
   const user = await requireUser();
-  const tournamentId = await getMatchTournamentId(matchId);
-  if (!tournamentId) return { error: "Match not found" };
-
-  const [tournament] = await db
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, tournamentId))
-    .limit(1);
-
-  if (!tournament || !await resolveIsTournamentOrganizer(tournament, user)) {
-    return { error: "Only the host can edit the start time." };
-  }
-  if (isTournamentArchived(tournament.date)) {
-    return { error: "This tournament is archived." };
-  }
 
   let scheduledTime: Date | null = null;
   if (isoTime) {
@@ -319,21 +306,72 @@ export async function updateMatchScheduledTime(
     scheduledTime = parsed;
   }
 
-  const [match] = await db
-    .select({ bracketId: matches.bracketId, courtId: matches.courtId })
-    .from(matches)
-    .where(eq(matches.id, matchId))
-    .limit(1);
+  try {
+    const result = await db.transaction(async (tx) => {
+      const executor = tx as unknown as MatchActionDbClient;
+      const [identity] = await executor
+        .select({ tournamentId: matches.tournamentId })
+        .from(matches)
+        .where(eq(matches.id, matchId))
+        .limit(1);
+      if (!identity) return { error: "Match not found" };
 
-  await db
-    .update(matches)
-    .set({ scheduledTime, updatedAt: new Date() })
-    .where(eq(matches.id, matchId));
+      const tournament = await loadLockedTournamentForOrganizer(
+        identity.tournamentId,
+        user.id,
+        executor
+      );
+      if (!tournament) {
+        return { error: "Only the host can edit the start time." };
+      }
+      if (isTournamentArchived(tournament.date)) {
+        return { error: "This tournament is archived." };
+      }
 
-  if (match?.bracketId) {
-    await assignBracketRefsForBracket(match.bracketId, db, {
-      resetRoundOneCourtId: match.courtId,
+      const [match] = await executor
+        .select({
+          bracketId: matches.bracketId,
+          courtId: matches.courtId,
+          status: matches.status,
+        })
+        .from(matches)
+        .where(
+          and(
+            eq(matches.id, matchId),
+            eq(matches.tournamentId, tournament.id)
+          )
+        )
+        .for("update")
+        .limit(1);
+      if (!match) return { error: "Match not found" };
+      if (match.status !== "upcoming") {
+        return { error: "The start time cannot change after play begins." };
+      }
+
+      const [updated] = await executor
+        .update(matches)
+        .set({ scheduledTime, updatedAt: new Date() })
+        .where(
+          and(
+            eq(matches.id, matchId),
+            eq(matches.tournamentId, tournament.id),
+            eq(matches.status, "upcoming")
+          )
+        )
+        .returning({ id: matches.id });
+      if (!updated) return { error: "Match not found" };
+
+      if (match.bracketId) {
+        await assignBracketRefsForBracket(match.bracketId, executor, {
+          resetRoundOneCourtId: match.courtId,
+        });
+      }
+      return { success: true as const };
     });
+    if ("error" in result) return result;
+  } catch (error) {
+    console.error("Could not update the match start time", error);
+    return { error: "Could not update the match start time." };
   }
 
   revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");

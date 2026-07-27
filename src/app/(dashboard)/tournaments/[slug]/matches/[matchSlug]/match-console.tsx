@@ -42,8 +42,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { StatusBadge } from "@/components/ui/status-badge";
+import { MatchRealtimeRefresh } from "@/components/realtime/match-realtime-refresh";
 import { cn } from "@/lib/utils";
-import { createClient } from "@/lib/supabase/client";
 import {
   buildMatchScoreState,
   matchPhase,
@@ -82,6 +82,7 @@ interface ConsoleMatch {
   teamB: { id: string; name: string } | null;
   refTeamName: string | null;
   courtName: string | null;
+  contextLabel: string | null;
   sets: { setNumber: number; teamAScore: number; teamBScore: number }[];
 }
 
@@ -96,7 +97,6 @@ interface ConsoleSettings {
 const SAVE_DEBOUNCE_MS = 1000;
 
 export function MatchConsole({
-  slug,
   tournamentDate,
   match,
   settings,
@@ -195,43 +195,6 @@ export function MatchConsole({
   const rightWinner =
     match.winnerId === (sidesFlipped ? match.teamA?.id : match.teamB?.id);
 
-  // ── Realtime: keep spectators (and the other team) in sync ──────────────
-  useEffect(() => {
-    const supabase = createClient();
-    let t: ReturnType<typeof setTimeout> | null = null;
-    const refresh = () => {
-      if (t) clearTimeout(t);
-      t = setTimeout(() => router.refresh(), 300);
-    };
-    const channel = supabase
-      .channel(`match-${match.id}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "sets",
-          filter: `match_id=eq.${match.id}`,
-        },
-        refresh
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "matches",
-          filter: `id=eq.${match.id}`,
-        },
-        refresh
-      )
-      .subscribe();
-    return () => {
-      if (t) clearTimeout(t);
-      supabase.removeChannel(channel);
-    };
-  }, [match.id, router]);
-
   async function runLifecycle(
     fn: () => Promise<
       {
@@ -273,6 +236,7 @@ export function MatchConsole({
 
   return (
     <div className="mx-auto max-w-2xl space-y-4">
+      <MatchRealtimeRefresh matchId={match.id} />
       {/* Header */}
       <Card>
         <CardHeader className="gap-3">
@@ -293,6 +257,7 @@ export function MatchConsole({
             />
           </div>
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
+            {match.contextLabel && <span>{match.contextLabel}</span>}
             {match.courtName && (
               <span className="flex items-center gap-1">
                 <MapPin className="h-3.5 w-3.5" />

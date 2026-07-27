@@ -31,8 +31,11 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Radio, Clock, CheckCircle2 } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ScoringCard } from "./scoring-card";
-import { LiveScoreViewer } from "./live-score-viewer";
-import { setStartingScoreForMatch } from "@/lib/tournaments/match-format";
+import { MatchRealtimeRefresh } from "@/components/realtime/match-realtime-refresh";
+import {
+  matchFormatForMatch,
+  setStartingScoreForMatch,
+} from "@/lib/tournaments/match-format";
 import { getTournamentBySlugIfVisible } from "@/lib/tournaments/access";
 import {
   canScoreMatches,
@@ -46,6 +49,8 @@ import {
 import type { Metadata } from "next";
 import { getTournamentNameBySlug } from "@/lib/tournaments/metadata";
 import { pageMetadata, pageTitle } from "@/lib/metadata";
+import { formatBracketRoundLabel } from "@/lib/tournaments/bracket-labels";
+import { isPlayableMatch } from "@/lib/tournaments/match-visibility";
 
 interface Props {
   params: Promise<{ slug: string }>;
@@ -82,6 +87,7 @@ export default async function ScoringPage({ params }: Props) {
           .from(matches)
           .where(inArray(matches.id, matchIds))
           .orderBy(asc(matches.scheduledTime));
+  allMatches = allMatches.filter(isPlayableMatch);
 
   if (!isOrganizer && allMatches.length > 0) {
     const [unreleasedDivisionIds, matchDivisionId] = await Promise.all([
@@ -151,6 +157,13 @@ export default async function ScoringPage({ params }: Props) {
         teamB,
         courtName: court?.name ?? null,
         refTeamName: refTeam?.name ?? null,
+        contextLabel:
+          match.bracketId && match.bracketRound
+            ? formatBracketRoundLabel({
+                section: match.bracketSection ?? "main",
+                round: match.bracketRound,
+              })
+            : null,
         sets: matchSets,
       };
     })
@@ -162,6 +175,7 @@ export default async function ScoringPage({ params }: Props) {
 
   return (
     <div className="space-y-6">
+      <MatchRealtimeRefresh tournamentId={id} />
       <BackLink href={`/tournaments/${slug}`}>Back to tournament</BackLink>
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Live Scoring</h1>
@@ -200,7 +214,10 @@ export default async function ScoringPage({ params }: Props) {
                   key={`${match.id}-${match.scoreRevision}`}
                   match={match}
                   canScore={canScore}
-                  matchFormat={tournament.matchFormat}
+                  matchFormat={matchFormatForMatch(
+                    tournament.matchFormat,
+                    match
+                  )}
                   setStartingScore={setStartingScoreForMatch(tournament, match)}
                   setTargetScore={tournament.setTargetScore}
                   tiebreakTargetScore={tournament.tiebreakTargetScore}
@@ -225,7 +242,10 @@ export default async function ScoringPage({ params }: Props) {
                   key={`${match.id}-${match.scoreRevision}`}
                   match={match}
                   canScore={canScore}
-                  matchFormat={tournament.matchFormat}
+                  matchFormat={matchFormatForMatch(
+                    tournament.matchFormat,
+                    match
+                  )}
                   setStartingScore={setStartingScoreForMatch(tournament, match)}
                   setTargetScore={tournament.setTargetScore}
                   tiebreakTargetScore={tournament.tiebreakTargetScore}
@@ -250,7 +270,10 @@ export default async function ScoringPage({ params }: Props) {
                   key={`${match.id}-${match.scoreRevision}`}
                   match={match}
                   canScore={canScore}
-                  matchFormat={tournament.matchFormat}
+                  matchFormat={matchFormatForMatch(
+                    tournament.matchFormat,
+                    match
+                  )}
                   setStartingScore={setStartingScoreForMatch(tournament, match)}
                   setTargetScore={tournament.setTargetScore}
                   tiebreakTargetScore={tournament.tiebreakTargetScore}
@@ -261,8 +284,6 @@ export default async function ScoringPage({ params }: Props) {
           )}
         </TabsContent>
       </Tabs>
-
-      <LiveScoreViewer tournamentId={id} />
     </div>
   );
 }

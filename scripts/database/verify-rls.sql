@@ -74,12 +74,20 @@ INSERT INTO public.matches (
   id,
   tournament_id,
   bracket_id,
+  bracket_section,
+  bracket_activation,
+  bracket_round,
+  bracket_position,
   slug
 )
 VALUES (
   '66666666-6666-6666-6666-666666666666',
   '33333333-3333-3333-3333-333333333333',
   '55555555-5555-5555-5555-555555555555',
+  'main',
+  'required',
+  1,
+  1,
   'bootstrap-match'
 );
 

@@ -24,15 +24,9 @@ export const PLAY_FORMATS = [
 
 export type PlayFormat = (typeof PLAY_FORMATS)[number];
 
-export const CREATABLE_PLAY_FORMATS = [
-  "pool_to_bracket",
-  "single_elimination",
-] as const satisfies readonly PlayFormat[];
+export const CREATABLE_PLAY_FORMATS = PLAY_FORMATS;
 
 export type CreatablePlayFormat = (typeof CREATABLE_PLAY_FORMATS)[number];
-
-export const DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE =
-  "Double elimination is not available for new tournaments yet.";
 
 export function isCreatablePlayFormat(
   value: unknown

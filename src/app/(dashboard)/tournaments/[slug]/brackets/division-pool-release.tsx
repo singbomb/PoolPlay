@@ -34,6 +34,7 @@ export function DivisionPoolRelease({
   poolsReleasedAt,
   matchCount,
   completedMatchCount,
+  kind = "pool",
 }: {
   tournamentId: string;
   divisionId: string;
@@ -41,6 +42,7 @@ export function DivisionPoolRelease({
   poolsReleasedAt: Date | null;
   matchCount: number;
   completedMatchCount: number;
+  kind?: "pool" | "bracket";
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -93,7 +95,10 @@ export function DivisionPoolRelease({
           <p className="text-sm font-medium">Host only — not released yet</p>
           <p className="text-xs text-muted-foreground">
             Only you can see {divisionName} until you release it. Participants
-            will then see standings, matches, and brackets.
+            will then see{" "}
+            {kind === "bracket"
+              ? "the bracket and its matches."
+              : "standings, matches, and brackets."}
           </p>
         </div>
         <Button
@@ -113,7 +118,13 @@ export function DivisionPoolRelease({
       </div>
       {matchCount === 0 ? (
         <p className="text-xs text-muted-foreground">
-          Save seeding on the Pools tab to generate matches before releasing.
+          Save seeding on the {kind === "bracket" ? "Bracket" : "Pools"} tab
+          to generate matches before releasing.
+        </p>
+      ) : kind === "bracket" ? (
+        <p className="text-xs text-muted-foreground">
+          Bracket generated with {matchCount} match
+          {matchCount === 1 ? "" : "es"}. Ready to release.
         </p>
       ) : !poolPlayComplete ? (
         <p className="text-xs text-warning">

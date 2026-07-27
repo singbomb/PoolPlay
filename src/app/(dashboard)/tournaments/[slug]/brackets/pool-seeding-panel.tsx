@@ -23,7 +23,10 @@ import { useRouter } from "next/navigation";
 import { ArrowDown, ArrowUp, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { updatePoolSeeding } from "./actions";
+import {
+  updateEliminationSeeding,
+  updatePoolSeeding,
+} from "./actions";
 import { cn } from "@/lib/utils";
 
 type PoolTeam = {
@@ -40,6 +43,7 @@ export function PoolSeedingPanel({
   teams,
   canEdit,
   matchesStarted,
+  mode = "pool",
 }: {
   tournamentId: string;
   poolId: string;
@@ -47,6 +51,7 @@ export function PoolSeedingPanel({
   teams: PoolTeam[];
   canEdit: boolean;
   matchesStarted: boolean;
+  mode?: "pool" | "elimination";
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -78,7 +83,10 @@ export function PoolSeedingPanel({
   function handleSave() {
     setError(null);
     startTransition(async () => {
-      const result = await updatePoolSeeding(tournamentId, poolId, order);
+      const result =
+        mode === "elimination"
+          ? await updateEliminationSeeding(tournamentId, poolId, order)
+          : await updatePoolSeeding(tournamentId, poolId, order);
       if (result?.error) {
         setError(result.error);
         return;
@@ -90,7 +98,8 @@ export function PoolSeedingPanel({
   if (teams.length < 2) {
     return (
       <p className="text-sm text-muted-foreground">
-        Add at least 2 confirmed teams to this pool before setting seeds.
+        Add at least 2 confirmed teams to this{" "}
+        {mode === "elimination" ? "division" : "pool"} before setting seeds.
       </p>
     );
   }
@@ -100,8 +109,10 @@ export function PoolSeedingPanel({
       <CardHeader className="pb-3">
         <CardTitle className="text-base">Seeding — {poolName}</CardTitle>
         <p className="text-sm text-muted-foreground">
-          Set seed order (1 = top seed). Saving creates round-robin matches in
-          that order.
+          Set seed order (1 = top seed).{" "}
+          {mode === "elimination"
+            ? "Saving creates the elimination bracket without pool-play matches."
+            : "Saving creates round-robin matches in that order."}
         </p>
       </CardHeader>
       <CardContent className="space-y-3">

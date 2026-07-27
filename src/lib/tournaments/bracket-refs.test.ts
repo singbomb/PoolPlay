@@ -23,6 +23,7 @@ import {
   eligibleBracketRefIds,
   matchLoserId,
   roundOneByeTeamIds,
+  shouldAutoAssignBracketRef,
 } from "./bracket-refs";
 
 const base = {
@@ -31,6 +32,14 @@ const base = {
   courtId: null,
   scheduledTime: null,
 };
+
+describe("shouldAutoAssignBracketRef", () => {
+  it("preserves the working team after play starts", () => {
+    assert.equal(shouldAutoAssignBracketRef({ status: "upcoming" }), true);
+    assert.equal(shouldAutoAssignBracketRef({ status: "in_progress" }), false);
+    assert.equal(shouldAutoAssignBracketRef({ status: "completed" }), false);
+  });
+});
 
 describe("roundOneByeTeamIds", () => {
   it("collects teams with byes", () => {
@@ -112,6 +121,97 @@ describe("assignBracketMatchRefs", () => {
     assert.ok(eligible.includes("b") || eligible.includes("d"));
     const refs = assignBracketMatchRefs(matches);
     assert.ok(refs.get("r2") === "b" || refs.get("r2") === "d");
+  });
+
+  it("only uses eliminated teams in double elimination", () => {
+    const matches = [
+      {
+        id: "winners-loss",
+        bracketSection: "winners",
+        bracketRound: 1,
+        bracketPosition: 1,
+        teamAId: "eliminated",
+        teamBId: "team-b",
+        winnerId: "team-b",
+        status: "completed",
+        courtId: null,
+        scheduledTime: null,
+      },
+      {
+        id: "losers-loss",
+        bracketSection: "losers",
+        bracketRound: 1,
+        bracketPosition: 1,
+        teamAId: "eliminated",
+        teamBId: "team-c",
+        winnerId: "team-c",
+        status: "completed",
+        courtId: null,
+        scheduledTime: null,
+      },
+      {
+        id: "target",
+        bracketSection: "losers",
+        bracketRound: 2,
+        bracketPosition: 1,
+        teamAId: "team-b",
+        teamBId: "team-c",
+        ...base,
+      },
+    ];
+
+    assert.deepEqual(eligibleBracketRefIds(matches[2], matches), [
+      "eliminated",
+    ]);
+  });
+
+  it("removes a double-elimination ref when a corrected loss reopens", () => {
+    const completedLosses = [
+      {
+        id: "winners-loss",
+        bracketSection: "winners",
+        bracketRound: 1,
+        bracketPosition: 1,
+        teamAId: "eliminated",
+        teamBId: "team-b",
+        winnerId: "team-b",
+        status: "completed",
+        courtId: null,
+        scheduledTime: null,
+      },
+      {
+        id: "losers-loss",
+        bracketSection: "losers",
+        bracketRound: 1,
+        bracketPosition: 1,
+        teamAId: "eliminated",
+        teamBId: "team-c",
+        winnerId: "team-c",
+        status: "completed",
+        courtId: null,
+        scheduledTime: null,
+      },
+      {
+        id: "target",
+        bracketSection: "losers",
+        bracketRound: 2,
+        bracketPosition: 1,
+        teamAId: "team-b",
+        teamBId: "team-c",
+        ...base,
+      },
+    ];
+    assert.equal(
+      assignBracketMatchRefs(completedLosses).get("target"),
+      "eliminated"
+    );
+
+    const corrected = completedLosses.map((match) =>
+      match.id === "losers-loss"
+        ? { ...match, winnerId: null, status: "upcoming" }
+        : match
+    );
+    assert.equal(assignBracketMatchRefs(corrected).get("target"), null);
   });
 });
 

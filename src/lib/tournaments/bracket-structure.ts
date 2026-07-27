@@ -16,9 +16,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
+  bracketMatchEdges,
   brackets,
   divisions,
   matches,
@@ -29,14 +30,14 @@ import {
   tournaments,
 } from "@/lib/db/schema";
 import {
-  bracketSizeForTeamCount,
   byeWinnerId,
-  createEmptyDoubleEliminationBracket,
   createEmptySingleEliminationBracket,
   generateSingleEliminationBracket,
   isByeMatch,
   bracketAdvanceTarget,
 } from "@/lib/utils/bracket";
+import { generateDoubleEliminationTopology } from "@/lib/tournaments/double-elimination-topology";
+import { projectPersistedBracketGraph } from "@/lib/tournaments/bracket-graph";
 import { calculatePoolStandings } from "@/lib/utils/pool";
 import { ensureDivisionAutoPool } from "./division-pools";
 import { isPoolPlayComplete } from "./pool-matches";
@@ -52,13 +53,12 @@ import {
 } from "@/lib/tournaments/bracket-tiers";
 import {
   assignBracketMatchRefs,
+  eligibleBracketRefIds,
+  shouldAutoAssignBracketRef,
   type BracketMatchForRefs,
 } from "@/lib/tournaments/bracket-refs";
 import { rankTeamsForCombinedBrackets } from "@/lib/tournaments/combined-bracket-standings";
-import {
-  DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE,
-  isCreatablePlayFormat,
-} from "@/lib/labels/play-format";
+import { isCreatablePlayFormat } from "@/lib/labels/play-format";
 
 type DbClient = typeof db;
 
@@ -121,38 +121,70 @@ async function insertBracketTree(
   taken: Set<string>
 ) {
   async function insertBracketMatch(m: {
-    teamAId: string | null;
-    teamBId: string | null;
     round: number;
     position: number;
-  }) {
+    section: "main" | "winners" | "losers" | "grand_final";
+    activation: "required" | "conditional";
+  }): Promise<string> {
+    const placeholder =
+      m.section === "main"
+        ? bracketPlaceholderSlug(m.round, m.position)
+        : `${m.section}-${bracketPlaceholderSlug(m.round, m.position)}`;
     const slug = reserveMatchSlug(
-      bracketPlaceholderSlug(m.round, m.position),
+      placeholder,
       taken
     );
-    await client.insert(matches).values({
-      tournamentId,
-      slug,
-      bracketId,
-      teamAId: m.teamAId,
-      teamBId: m.teamBId,
-      bracketRound: m.round,
-      bracketPosition: m.position,
-      status: "upcoming",
-    });
+    const [inserted] = await client
+      .insert(matches)
+      .values({
+        tournamentId,
+        slug,
+        bracketId,
+        bracketSection: m.section,
+        bracketActivation: m.activation,
+        bracketRound: m.round,
+        bracketPosition: m.position,
+        status: "upcoming",
+      })
+      .returning({ id: matches.id });
+    if (!inserted) throw new Error("Could not create bracket match.");
+    return inserted.id;
   }
 
   if (format === "double_elimination") {
-    const { winners, losers, grandFinal } =
-      createEmptyDoubleEliminationBracket(slots);
-    for (const m of winners) await insertBracketMatch(m);
-    for (const m of losers) await insertBracketMatch(m);
-    await insertBracketMatch(grandFinal);
+    const topology = generateDoubleEliminationTopology(slots);
+    const matchIdByKey = new Map<string, string>();
+    for (const node of topology.nodes) {
+      const matchId = await insertBracketMatch({
+        round: node.round,
+        position: node.position,
+        section: node.section,
+        activation: node.activation,
+      });
+      matchIdByKey.set(node.key, matchId);
+    }
+    for (const edge of topology.edges) {
+      await client.insert(bracketMatchEdges).values({
+        bracketId,
+        sourceMatchId: matchIdByKey.get(edge.sourceKey)!,
+        sourceOutcome: edge.outcome,
+        targetMatchId: matchIdByKey.get(edge.targetKey)!,
+        targetSlot: edge.targetSlot === "A" ? "team_a" : "team_b",
+        condition: edge.condition,
+      });
+    }
     return;
   }
 
   const skeleton = createEmptySingleEliminationBracket(slots);
-  for (const m of skeleton) await insertBracketMatch(m);
+  for (const m of skeleton) {
+    await insertBracketMatch({
+      round: m.round,
+      position: m.position,
+      section: "main",
+      activation: "required",
+    });
+  }
 }
 
 /**
@@ -164,12 +196,7 @@ export async function ensureDivisionBracketSkeleton(
   format: string,
   client: DbClient = db
 ): Promise<void> {
-  if (!isCreatablePlayFormat(format)) {
-    if (format === "double_elimination") {
-      throw new Error(DOUBLE_ELIMINATION_UNAVAILABLE_MESSAGE);
-    }
-    return;
-  }
+  if (!isCreatablePlayFormat(format)) return;
 
   const [division] = await client
     .select({ tournamentId: divisions.tournamentId })
@@ -197,7 +224,10 @@ export async function ensureDivisionBracketSkeleton(
 
   await client.insert(brackets).values({
     divisionId,
-    bracketType: "single_elimination",
+    bracketType:
+      format === "double_elimination"
+        ? "double_elimination"
+        : "single_elimination",
     seedCount: 0,
     name: null,
     tier: 0,
@@ -297,8 +327,9 @@ export async function ensureTournamentCombinedBrackets(
   }
 }
 
-async function bracketRoundOneHasTeams(
+async function bracketOpeningMatchesMatch(
   bracketId: string,
+  expected: Array<{ teamAId: string | null; teamBId: string | null }>,
   client: DbClient
 ): Promise<boolean> {
   const roundOne = await client
@@ -308,10 +339,25 @@ async function bracketRoundOneHasTeams(
     })
     .from(matches)
     .where(
-      and(eq(matches.bracketId, bracketId), eq(matches.bracketRound, 1))
-    );
+      and(
+        eq(matches.bracketId, bracketId),
+        eq(matches.bracketRound, 1),
+        or(
+          eq(matches.bracketSection, "main"),
+          eq(matches.bracketSection, "winners")
+        )
+      )
+    )
+    .orderBy(asc(matches.bracketPosition));
 
-  return roundOne.some((m) => m.teamAId != null || m.teamBId != null);
+  return (
+    roundOne.length === expected.length &&
+    roundOne.every(
+      (match, index) =>
+        match.teamAId === expected[index].teamAId &&
+        match.teamBId === expected[index].teamBId
+    )
+  );
 }
 
 async function bracketHasPlayBeyondByes(
@@ -320,42 +366,33 @@ async function bracketHasPlayBeyondByes(
 ): Promise<boolean> {
   const rows = await client
     .select({
-      bracketRound: matches.bracketRound,
       teamAId: matches.teamAId,
       teamBId: matches.teamBId,
       status: matches.status,
+      warmupStartedAt: matches.warmupStartedAt,
+      startedAt: matches.startedAt,
     })
     .from(matches)
     .where(eq(matches.bracketId, bracketId));
 
   return rows.some((m) => {
-    if (m.bracketRound != null && m.bracketRound > 1 && m.status === "completed") {
+    if (m.warmupStartedAt || m.startedAt || m.status === "in_progress") {
       return true;
     }
-    if (m.status !== "completed") return false;
-    // Completed round-1 match with two real teams means play has started.
-    return Boolean(m.teamAId && m.teamBId);
+    return m.status === "completed" && Boolean(m.teamAId && m.teamBId);
   });
 }
 
-async function bracketIsSeededForTeamCount(
+async function bracketHasGraph(
   bracketId: string,
-  teamCount: number,
   client: DbClient
 ): Promise<boolean> {
-  const [bracket] = await client
-    .select({ seedCount: brackets.seedCount })
-    .from(brackets)
-    .where(eq(brackets.id, bracketId))
+  const [edge] = await client
+    .select({ bracketId: bracketMatchEdges.bracketId })
+    .from(bracketMatchEdges)
+    .where(eq(bracketMatchEdges.bracketId, bracketId))
     .limit(1);
-
-  if (!bracket || bracket.seedCount !== teamCount) return false;
-
-  const expectedRoundOne = bracketSizeForTeamCount(teamCount) / 2;
-  const currentRoundOne = await countRoundOneMatches(bracketId, client);
-  if (currentRoundOne !== expectedRoundOne) return false;
-
-  return bracketRoundOneHasTeams(bracketId, client);
+  return edge != null;
 }
 
 async function countRoundOneMatches(
@@ -366,9 +403,46 @@ async function countRoundOneMatches(
     .select({ id: matches.id })
     .from(matches)
     .where(
-      and(eq(matches.bracketId, bracketId), eq(matches.bracketRound, 1))
+      and(
+        eq(matches.bracketId, bracketId),
+        eq(matches.bracketRound, 1),
+        or(
+          eq(matches.bracketSection, "main"),
+          eq(matches.bracketSection, "winners")
+        )
+      )
     );
   return rows.length;
+}
+
+async function resetBracketMatchState(
+  bracketId: string,
+  client: DbClient
+): Promise<void> {
+  await client
+    .update(matches)
+    .set({
+      teamAId: null,
+      teamBId: null,
+      refTeamId: null,
+      winnerId: null,
+      bracketActivation: "required",
+      status: "upcoming",
+      warmupStartedAt: null,
+      startedAt: null,
+      updatedAt: new Date(),
+    })
+    .where(eq(matches.bracketId, bracketId));
+  await client
+    .update(matches)
+    .set({ bracketActivation: "conditional", updatedAt: new Date() })
+    .where(
+      and(
+        eq(matches.bracketId, bracketId),
+        eq(matches.bracketSection, "grand_final"),
+        eq(matches.bracketRound, 2)
+      )
+    );
 }
 
 async function rebuildBracketTree(
@@ -376,9 +450,17 @@ async function rebuildBracketTree(
   tournamentId: string,
   bracketId: string,
   format: string,
-  teamCount: number,
-  taken: Set<string>
+  teamCount: number
 ): Promise<void> {
+  const existingMatches = await client
+    .select({ id: matches.id })
+    .from(matches)
+    .where(eq(matches.bracketId, bracketId));
+  const taken = await getTakenMatchSlugsInTournament(
+    tournamentId,
+    existingMatches.map((match) => match.id),
+    client
+  );
   await client.delete(matches).where(eq(matches.bracketId, bracketId));
   await insertBracketTree(
     client,
@@ -390,7 +472,14 @@ async function rebuildBracketTree(
   );
   await client
     .update(brackets)
-    .set({ seedCount: teamCount })
+    .set({
+      bracketType:
+        format === "double_elimination"
+          ? "double_elimination"
+          : "single_elimination",
+      seedCount: teamCount,
+      topologyVersion: format === "double_elimination" ? 2 : 1,
+    })
     .where(eq(brackets.id, bracketId));
 }
 
@@ -403,6 +492,8 @@ async function applyRoundOneByeAdvancement(
   roundOneSlots: ReturnType<typeof generateSingleEliminationBracket>,
   client: DbClient
 ): Promise<void> {
+  if (await projectPersistedBracketGraph(bracketId, client)) return;
+
   const roundTwoRows = await client
     .select({
       id: matches.id,
@@ -412,7 +503,11 @@ async function applyRoundOneByeAdvancement(
     })
     .from(matches)
     .where(
-      and(eq(matches.bracketId, bracketId), eq(matches.bracketRound, 2))
+      and(
+        eq(matches.bracketId, bracketId),
+        eq(matches.bracketSection, "main"),
+        eq(matches.bracketRound, 2)
+      )
     )
     .orderBy(asc(matches.bracketPosition));
 
@@ -433,6 +528,7 @@ async function applyRoundOneByeAdvancement(
         and(
           eq(matches.bracketId, bracketId),
           eq(matches.bracketRound, 1),
+          eq(matches.bracketSection, "main"),
           eq(matches.bracketPosition, slot.position)
         )
       )
@@ -486,6 +582,7 @@ export async function advanceBracketWinner(
       bracketId: matches.bracketId,
       bracketRound: matches.bracketRound,
       bracketPosition: matches.bracketPosition,
+      bracketSection: matches.bracketSection,
       winnerId: matches.winnerId,
       status: matches.status,
     })
@@ -504,6 +601,10 @@ export async function advanceBracketWinner(
   }
 
   const feed = bracketAdvanceTarget(match.bracketRound, match.bracketPosition);
+  if (await projectPersistedBracketGraph(match.bracketId, client)) {
+    await assignBracketRefsForBracket(match.bracketId, client);
+    return;
+  }
 
   const [nextMatch] = await client
     .select({
@@ -513,6 +614,7 @@ export async function advanceBracketWinner(
     .where(
       and(
         eq(matches.bracketId, match.bracketId),
+        eq(matches.bracketSection, match.bracketSection ?? "main"),
         eq(matches.bracketRound, feed.round),
         eq(matches.bracketPosition, feed.position)
       )
@@ -538,6 +640,11 @@ export async function repairBracketWinnerAdvances(
   bracketId: string,
   client: DbClient = db
 ): Promise<void> {
+  if (await projectPersistedBracketGraph(bracketId, client)) {
+    await assignBracketRefsForBracket(bracketId, client);
+    return;
+  }
+
   const completed = await client
     .select({ id: matches.id })
     .from(matches)
@@ -566,7 +673,8 @@ export async function assignBracketRefsForBracket(
         and(
           eq(matches.bracketId, bracketId),
           eq(matches.bracketRound, 1),
-          eq(matches.courtId, options.resetRoundOneCourtId)
+          eq(matches.courtId, options.resetRoundOneCourtId),
+          eq(matches.status, "upcoming")
         )
       );
   }
@@ -574,6 +682,7 @@ export async function assignBracketRefsForBracket(
   const rows = await client
     .select({
       id: matches.id,
+      bracketSection: matches.bracketSection,
       bracketRound: matches.bracketRound,
       bracketPosition: matches.bracketPosition,
       teamAId: matches.teamAId,
@@ -586,12 +695,17 @@ export async function assignBracketRefsForBracket(
     })
     .from(matches)
     .where(eq(matches.bracketId, bracketId))
-    .orderBy(asc(matches.bracketRound), asc(matches.bracketPosition));
+    .orderBy(
+      asc(matches.bracketSection),
+      asc(matches.bracketRound),
+      asc(matches.bracketPosition)
+    );
 
   const forRefs: BracketMatchForRefs[] = rows
     .filter((m) => m.bracketRound != null && m.bracketPosition != null)
     .map((m) => ({
       id: m.id,
+      bracketSection: m.bracketSection,
       bracketRound: m.bracketRound!,
       bracketPosition: m.bracketPosition!,
       teamAId: m.teamAId,
@@ -606,12 +720,23 @@ export async function assignBracketRefsForBracket(
 
   for (const [matchId, refTeamId] of assignments) {
     const row = rows.find((r) => r.id === matchId);
-    if (!row || row.status === "completed") continue;
-    if (row.refTeamId != null && !options?.resetRoundOneCourtId) continue;
+    if (!row || !shouldAutoAssignBracketRef(row)) continue;
+    const target = forRefs.find((match) => match.id === matchId);
+    const existingRefIsEligible =
+      target != null &&
+      row.refTeamId != null &&
+      eligibleBracketRefIds(target, forRefs).includes(row.refTeamId);
+    if (existingRefIsEligible && !options?.resetRoundOneCourtId) continue;
+    if (row.refTeamId === refTeamId) continue;
     await client
       .update(matches)
       .set({ refTeamId, updatedAt: new Date() })
-      .where(eq(matches.id, matchId));
+      .where(
+        and(
+          eq(matches.id, matchId),
+          eq(matches.status, "upcoming")
+        )
+      );
   }
 }
 
@@ -629,50 +754,15 @@ export async function fillBracketRoundOne(
   }
 
   const teamCount = seededTeamIds.length;
-
-  if (await bracketIsSeededForTeamCount(bracketId, teamCount, client)) {
-    return {};
-  }
-
-  if (await bracketHasPlayBeyondByes(bracketId, client)) {
-    return { error: "Bracket play has started — cannot re-seed" };
-  }
-
-  const expectedRoundOneMatches = bracketSizeForTeamCount(teamCount) / 2;
-  let currentRoundOneMatches = await countRoundOneMatches(bracketId, client);
-
-  const [bracketRow] = await client
-    .select({ seedCount: brackets.seedCount })
-    .from(brackets)
-    .where(eq(brackets.id, bracketId))
-    .limit(1);
-
-  if (
-    bracketRow &&
-    bracketRow.seedCount !== 0 &&
-    bracketRow.seedCount !== teamCount &&
-    !(await bracketRoundOneHasTeams(bracketId, client))
-  ) {
-    await client.delete(matches).where(eq(matches.bracketId, bracketId));
-    await client
-      .update(brackets)
-      .set({ seedCount: 0 })
-      .where(eq(brackets.id, bracketId));
-    currentRoundOneMatches = 0;
-  }
-
-  if (
-    currentRoundOneMatches > 0 &&
-    currentRoundOneMatches !== expectedRoundOneMatches
-  ) {
-    await client.delete(matches).where(eq(matches.bracketId, bracketId));
-    currentRoundOneMatches = 0;
-  }
-
+  const generated = generateSingleEliminationBracket(seededTeamIds);
+  const roundOne = generated.filter((match) => match.round === 1);
   const [bracketMeta] = await client
     .select({
       tournamentId: divisions.tournamentId,
       format: divisions.format,
+      bracketType: brackets.bracketType,
+      seedCount: brackets.seedCount,
+      topologyVersion: brackets.topologyVersion,
     })
     .from(brackets)
     .innerJoin(divisions, eq(brackets.divisionId, divisions.id))
@@ -682,25 +772,48 @@ export async function fillBracketRoundOne(
   if (!bracketMeta?.tournamentId) return { error: "Bracket not found" };
 
   const format = bracketMeta.format ?? "pool_to_bracket";
+  const expectedBracketType =
+    format === "double_elimination"
+      ? "double_elimination"
+      : "single_elimination";
+  const graphReady =
+    format !== "double_elimination" ||
+    (bracketMeta.topologyVersion >= 2 &&
+      (await bracketHasGraph(bracketId, client)));
+  const openingMatchesMatch = await bracketOpeningMatchesMatch(
+    bracketId,
+    roundOne,
+    client
+  );
+  if (
+    bracketMeta.seedCount === teamCount &&
+    bracketMeta.bracketType === expectedBracketType &&
+    graphReady &&
+    openingMatchesMatch
+  ) {
+    return {};
+  }
 
-  if (currentRoundOneMatches !== expectedRoundOneMatches) {
-    const taken = await getTakenMatchSlugsInTournament(
-      bracketMeta.tournamentId,
-      [],
-      client
-    );
+  if (await bracketHasPlayBeyondByes(bracketId, client)) {
+    return { error: "Bracket play has started — cannot re-seed" };
+  }
+
+  const currentRoundOneMatches = await countRoundOneMatches(bracketId, client);
+  if (
+    currentRoundOneMatches !== roundOne.length ||
+    bracketMeta.bracketType !== expectedBracketType ||
+    !graphReady
+  ) {
     await rebuildBracketTree(
       client,
       bracketMeta.tournamentId,
       bracketId,
       format,
-      teamCount,
-      taken
+      teamCount
     );
+  } else {
+    await resetBracketMatchState(bracketId, client);
   }
-
-  const generated = generateSingleEliminationBracket(seededTeamIds);
-  const roundOne = generated.filter((m) => m.round === 1);
 
   const existing = await client
     .select({
@@ -709,7 +822,14 @@ export async function fillBracketRoundOne(
     })
     .from(matches)
     .where(
-      and(eq(matches.bracketId, bracketId), eq(matches.bracketRound, 1))
+      and(
+        eq(matches.bracketId, bracketId),
+        eq(matches.bracketRound, 1),
+        or(
+          eq(matches.bracketSection, "main"),
+          eq(matches.bracketSection, "winners")
+        )
+      )
     )
     .orderBy(asc(matches.bracketPosition));
 
@@ -759,6 +879,9 @@ export async function fillBracketRoundOne(
       .set({
         teamAId: slot.teamAId,
         teamBId: slot.teamBId,
+        bracketActivation: "required",
+        status: "upcoming",
+        winnerId: null,
         ...(slug ? { slug } : {}),
       })
       .where(eq(matches.id, matchId));
@@ -940,47 +1063,6 @@ export async function tryFillTournamentCombinedBrackets(
 
     await fillBracketRoundOne(bracket.id, teamIds, client);
   }
-}
-
-/**
- * Single-elimination pools: fill round 1 from seed order once teams are set.
- */
-export async function tryFillBracketFromDivisionSeeds(
-  divisionId: string,
-  client: DbClient = db
-): Promise<void> {
-  const [division] = await client
-    .select({ format: divisions.format })
-    .from(divisions)
-    .where(eq(divisions.id, divisionId))
-    .limit(1);
-
-  if (!division || division.format !== "single_elimination") return;
-
-  const poolId = await ensureDivisionAutoPool(divisionId, client);
-  if (!poolId) return;
-
-  const members = await client
-    .select({ teamId: poolTeams.teamId })
-    .from(poolTeams)
-    .where(eq(poolTeams.poolId, poolId))
-    .orderBy(asc(poolTeams.seed));
-
-  if (members.length < 2) return;
-
-  const [bracket] = await client
-    .select({ id: brackets.id })
-    .from(brackets)
-    .where(eq(brackets.divisionId, divisionId))
-    .limit(1);
-
-  if (!bracket) return;
-
-  await fillBracketRoundOne(
-    bracket.id,
-    members.map((m) => m.teamId),
-    client
-  );
 }
 
 async function tournamentPoolToBracketOwnerId(

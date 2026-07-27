@@ -20,8 +20,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   allActiveBracketsHaveChampions,
+  allActiveBracketsMatchCurrentRoster,
+  allCompetitionDivisionsHaveChampions,
   bracketHasChampion,
   bracketIsActive,
+  bracketMatchesCurrentRoster,
 } from "./tournament-completion";
 
 const final = (
@@ -91,6 +94,99 @@ describe("bracketHasChampion", () => {
       true
     );
   });
+
+  it("requires the reset final after the losers-side finalist wins GF1", () => {
+    const grandFinal = {
+      ...final(),
+      bracketRound: 1,
+      bracketSection: "grand_final",
+      teamAId: "winners-team",
+      teamBId: "losers-team",
+      winnerId: "losers-team",
+    };
+    const resetFinal = {
+      ...final(),
+      bracketRound: 2,
+      bracketSection: "grand_final",
+      bracketActivation: "required",
+      status: "upcoming",
+      winnerId: null,
+    };
+
+    assert.equal(
+      bracketHasChampion(
+        [grandFinal, resetFinal],
+        "double_elimination"
+      ),
+      false
+    );
+    assert.equal(
+      bracketHasChampion(
+        [
+          grandFinal,
+          {
+            ...resetFinal,
+            status: "completed",
+            winnerId: "winners-team",
+          },
+        ],
+        "double_elimination"
+      ),
+      true
+    );
+  });
+
+  it("uses GF1 when the reset final is not required", () => {
+    assert.equal(
+      bracketHasChampion(
+        [
+          {
+            ...final(),
+            bracketRound: 1,
+            bracketSection: "grand_final",
+          },
+          {
+            ...final(),
+            bracketRound: 2,
+            bracketSection: "grand_final",
+            bracketActivation: "not_required",
+            status: "upcoming",
+            winnerId: null,
+            teamAId: null,
+            teamBId: null,
+          },
+        ],
+        "double_elimination"
+      ),
+      true
+    );
+  });
+
+  it("does not complete while the reset condition is unresolved", () => {
+    assert.equal(
+      bracketHasChampion(
+        [
+          {
+            ...final(),
+            bracketRound: 1,
+            bracketSection: "grand_final",
+          },
+          {
+            ...final(),
+            bracketRound: 2,
+            bracketSection: "grand_final",
+            bracketActivation: "conditional",
+            status: "upcoming",
+            winnerId: null,
+            teamAId: null,
+            teamBId: null,
+          },
+        ],
+        "double_elimination"
+      ),
+      false
+    );
+  });
 });
 
 describe("allActiveBracketsHaveChampions", () => {
@@ -127,6 +223,154 @@ describe("allActiveBracketsHaveChampions", () => {
           ],
         },
       ]),
+      false
+    );
+  });
+});
+
+describe("allCompetitionDivisionsHaveChampions", () => {
+  it("does not finish while another straight-elimination division is unseeded", () => {
+    assert.equal(
+      allCompetitionDivisionsHaveChampions(
+        [
+          {
+            bracketType: "single_elimination",
+            divisionId: "division-a",
+            seedCount: 3,
+            matches: [semi(1), final()],
+          },
+          {
+            bracketType: "double_elimination",
+            divisionId: "division-b",
+            seedCount: 0,
+            matches: [],
+          },
+        ],
+        new Set(["division-a", "division-b"])
+      ),
+      false
+    );
+  });
+
+  it("finishes after every competition-bearing division has a champion", () => {
+    assert.equal(
+      allCompetitionDivisionsHaveChampions(
+        [
+          {
+            bracketType: "single_elimination",
+            divisionId: "division-a",
+            seedCount: 3,
+            matches: [semi(1), final()],
+          },
+          {
+            bracketType: "single_elimination",
+            divisionId: "division-b",
+            seedCount: 3,
+            matches: [semi(1), final()],
+          },
+          {
+            bracketType: "single_elimination",
+            divisionId: "unused-pool-tier",
+            seedCount: 0,
+            matches: [],
+          },
+        ],
+        new Set(["division-a", "division-b"])
+      ),
+      true
+    );
+  });
+});
+
+describe("bracketMatchesCurrentRoster", () => {
+  const seededBracket = {
+    bracketType: "single_elimination",
+    divisionId: "division-a",
+    seedCount: 3,
+    matches: [semi(1), final()],
+  };
+
+  it("accepts the exact seeded team set", () => {
+    assert.equal(
+      bracketMatchesCurrentRoster(
+        seededBracket,
+        new Set(["t1", "t2", "t3"])
+      ),
+      true
+    );
+  });
+
+  it("rejects added, removed, and same-count swapped teams", () => {
+    assert.equal(
+      bracketMatchesCurrentRoster(
+        seededBracket,
+        new Set(["t1", "t2", "t3", "t4"])
+      ),
+      false
+    );
+    assert.equal(
+      bracketMatchesCurrentRoster(seededBracket, new Set(["t1", "t2"])),
+      false
+    );
+    assert.equal(
+      bracketMatchesCurrentRoster(
+        seededBracket,
+        new Set(["t1", "t2", "replacement"])
+      ),
+      false
+    );
+    assert.equal(
+      bracketMatchesCurrentRoster(seededBracket, new Set(["t1"])),
+      false
+    );
+  });
+});
+
+describe("allActiveBracketsMatchCurrentRoster", () => {
+  it("rejects any stale active bracket and rosters below two teams", () => {
+    const current = {
+      bracketType: "single_elimination",
+      divisionId: "division-a",
+      seedCount: 2,
+      matches: [
+        {
+          bracketRound: 1,
+          status: "upcoming",
+          winnerId: null,
+          teamAId: "t1",
+          teamBId: "t2",
+        },
+      ],
+    };
+    const stale = {
+      ...current,
+      matches: [
+        {
+          bracketRound: 1,
+          status: "completed",
+          winnerId: "t1",
+          teamAId: "t1",
+          teamBId: "old-team",
+        },
+      ],
+    };
+
+    assert.equal(
+      allActiveBracketsMatchCurrentRoster(
+        [current],
+        new Set(["t1", "t2"])
+      ),
+      true
+    );
+    assert.equal(
+      allActiveBracketsMatchCurrentRoster(
+        [current, stale],
+        new Set(["t1", "t2"])
+      ),
+      false
+    );
+    assert.equal(
+      allActiveBracketsMatchCurrentRoster([stale], new Set(["t1"])),
       false
     );
   });

@@ -35,6 +35,7 @@ import {
   type DbClient,
   type LockedMatch,
   assertActorCanMutateLockedMatch,
+  assertLockedMatchIsPlayable,
   finalizeLockedMatch,
   insertScoreEvent,
   loadLockedMatch,
@@ -61,6 +62,7 @@ function assertTournamentInProgress(match: LockedMatch): void {
 
 function validateScoreWrite(match: LockedMatch, input: SaveSetInput): void {
   assertExpectedRevision(match.scoreRevision, input.expectedRevision);
+  assertLockedMatchIsPlayable(match);
   assertTournamentInProgress(match);
   if (match.status === "completed") {
     throw new OperationConflictError(

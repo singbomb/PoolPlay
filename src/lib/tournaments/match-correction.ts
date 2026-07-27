@@ -8,10 +8,17 @@
  * (at your option) any later version.
  */
 
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { brackets, divisions, matches, sets } from "@/lib/db/schema";
+import {
+  bracketMatchEdges,
+  brackets,
+  divisions,
+  matches,
+  sets,
+} from "@/lib/db/schema";
 import { assignBracketRefsForBracket } from "@/lib/tournaments/bracket-structure";
+import { projectPersistedBracketGraph } from "@/lib/tournaments/bracket-graph";
 import {
   OperationConflictError,
   OperationValidationError,
@@ -22,6 +29,7 @@ import {
   type LockedMatch,
   type MatchStatus,
   assertActorCanMutateLockedMatch,
+  assertLockedMatchIsPlayable,
   insertScoreEvent,
   loadLockedMatch,
 } from "@/lib/tournaments/score-operation-support";
@@ -42,12 +50,14 @@ type InvalidatedMatch = {
   scoreRevision: number;
 };
 
+type SlotToClear = "A" | "B" | "both";
+
 async function invalidateMatch(
   row: InvalidatedMatch,
   actorUserId: string,
   reason: string,
   executor: DbClient,
-  slotToClear: "A" | "B" | "both"
+  slotToClear: SlotToClear
 ): Promise<void> {
   await executor.delete(sets).where(eq(sets.matchId, row.id));
   const teamAId =
@@ -88,6 +98,100 @@ async function invalidateMatch(
     },
     correctionReason: reason,
   });
+}
+
+function slotToClear(slots: Set<"A" | "B">): SlotToClear {
+  if (slots.size === 2) return "both";
+  return slots.has("A") ? "A" : "B";
+}
+
+async function loadGraphInvalidationPlan(
+  bracketId: string,
+  sourceMatchId: string,
+  executor: DbClient
+): Promise<Map<string, Set<"A" | "B">> | null> {
+  const edges = await executor
+    .select({
+      sourceMatchId: bracketMatchEdges.sourceMatchId,
+      targetMatchId: bracketMatchEdges.targetMatchId,
+      targetSlot: bracketMatchEdges.targetSlot,
+    })
+    .from(bracketMatchEdges)
+    .where(eq(bracketMatchEdges.bracketId, bracketId));
+  if (edges.length === 0) return null;
+
+  const outgoing = new Map<string, typeof edges>();
+  for (const edge of edges) {
+    const list = outgoing.get(edge.sourceMatchId) ?? [];
+    list.push(edge);
+    outgoing.set(edge.sourceMatchId, list);
+  }
+
+  const plan = new Map<string, Set<"A" | "B">>();
+  const queue = [sourceMatchId];
+  const expanded = new Set<string>();
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (expanded.has(current)) continue;
+    expanded.add(current);
+    for (const edge of outgoing.get(current) ?? []) {
+      const slots = plan.get(edge.targetMatchId) ?? new Set<"A" | "B">();
+      slots.add(edge.targetSlot === "team_a" ? "A" : "B");
+      plan.set(edge.targetMatchId, slots);
+      queue.push(edge.targetMatchId);
+    }
+  }
+  return plan;
+}
+
+async function invalidateGraphDescendants(
+  source: LockedMatch,
+  actorUserId: string,
+  reason: string,
+  executor: DbClient
+): Promise<number | null> {
+  if (!source.bracketId) return null;
+  const plan = await loadGraphInvalidationPlan(
+    source.bracketId,
+    source.id,
+    executor
+  );
+  if (plan === null) return null;
+  const ids = [...plan.keys()];
+  if (ids.length === 0) return 0;
+
+  const rows = await executor
+    .select({
+      id: matches.id,
+      bracketId: matches.bracketId,
+      bracketRound: matches.bracketRound,
+      bracketPosition: matches.bracketPosition,
+      teamAId: matches.teamAId,
+      teamBId: matches.teamBId,
+      winnerId: matches.winnerId,
+      status: matches.status,
+      scoreRevision: matches.scoreRevision,
+    })
+    .from(matches)
+    .where(inArray(matches.id, ids))
+    .orderBy(asc(matches.id))
+    .for("update");
+  const rowById = new Map(rows.map((row) => [row.id, row]));
+
+  for (const [matchId, slots] of plan) {
+    const row = rowById.get(matchId);
+    if (!row) continue;
+    await invalidateMatch(
+      row,
+      actorUserId,
+      reason,
+      executor,
+      slotToClear(slots)
+    );
+  }
+  await projectPersistedBracketGraph(source.bracketId, executor);
+  await assignBracketRefsForBracket(source.bracketId, executor);
+  return rows.length;
 }
 
 async function loadNextBracketMatch(
@@ -133,6 +237,14 @@ async function invalidateBracketDescendants(
   ) {
     return 0;
   }
+  const graphInvalidated = await invalidateGraphDescendants(
+    source,
+    actorUserId,
+    reason,
+    executor
+  );
+  if (graphInvalidated !== null) return graphInvalidated;
+
   let round = source.bracketRound;
   let position = source.bracketPosition;
   let invalidated = 0;
@@ -314,6 +426,7 @@ export async function reopenMatchForCorrection(input: {
       true
     );
     assertExpectedRevision(match.scoreRevision, input.expectedRevision);
+    assertLockedMatchIsPlayable(match);
     if (match.status !== "completed") {
       throw new OperationConflictError(
         "Only a completed match can be reopened.",
