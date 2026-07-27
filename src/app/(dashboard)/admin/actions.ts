@@ -19,7 +19,7 @@
  */
 
 import { revalidatePath } from "next/cache";
-import { eq, inArray, ne, or } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, or } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
   brackets,
@@ -36,6 +36,7 @@ import {
 import { requireAdmin } from "@/lib/auth";
 import { slugify, uniqueSlug } from "@/lib/utils/slug";
 import { flagBlockedContent } from "@/lib/admin/content-flags";
+import { createAdminClient } from "@/lib/supabase/admin";
 import type { UserRole, TournamentStatus } from "@/types";
 
 const VALID_ROLES: UserRole[] = ["player", "captain", "organizer", "admin"];
@@ -51,7 +52,7 @@ export async function setUserRole(userId: string, role: UserRole) {
     const otherAdmins = await db
       .select({ id: users.id })
       .from(users)
-      .where(eq(users.role, "admin"))
+      .where(and(eq(users.role, "admin"), isNull(users.disabledAt)))
       .limit(2);
     if (otherAdmins.length <= 1) {
       return { error: "You can't demote the only remaining admin." };
@@ -67,25 +68,56 @@ export async function setUserRole(userId: string, role: UserRole) {
   return { success: true as const };
 }
 
-export async function adminDeleteUser(userId: string) {
+export async function adminDisableUser(userId: string) {
   const admin = await requireAdmin();
 
   if (userId === admin.id) {
-    return { error: "You can't delete your own account from the admin panel." };
+    return { error: "You can't disable your own account from the admin panel." };
   }
+
+  const [target] = await db
+    .select({
+      authId: users.authId,
+      disabledAt: users.disabledAt,
+    })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  if (!target) {
+    return { error: "User not found" };
+  }
+  if (!target.disabledAt) {
+    try {
+      const [disabled] = await db
+        .update(users)
+        .set({ disabledAt: new Date(), updatedAt: new Date() })
+        .where(eq(users.id, userId))
+        .returning({ id: users.id });
+      if (!disabled) throw new Error("User disappeared while disabling");
+    } catch {
+      return { error: "Could not save the disabled status. Try again." };
+    }
+  }
+
+  revalidatePath("/admin");
 
   try {
-    await db.delete(users).where(eq(users.id, userId));
+    const authAdmin = createAdminClient();
+    const { error } = await authAdmin.auth.admin.updateUserById(target.authId, {
+      ban_duration: "876000h",
+    });
+    if (error) {
+      return { success: true as const, authBanPending: true as const };
+    }
   } catch {
-    return {
-      error:
-        "Could not delete user — they may still own tournaments. Reassign or delete those first.",
-    };
+    return { success: true as const, authBanPending: true as const };
   }
 
-  revalidatePath("/admin");
-  revalidatePath("/admin");
-  return { success: true as const };
+  return {
+    success: true as const,
+    ...(target.disabledAt ? { alreadyDisabled: true as const } : {}),
+  };
 }
 
 export async function adminRenameTournament(

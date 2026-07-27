@@ -45,7 +45,7 @@ describe("validateBracketTierSettings", () => {
     const result = validateBracketTierSettings(10, 3, 6, 4);
     assert.equal(result.ok, false);
     if (!result.ok) {
-      assert.match(result.error, /No teams left for bronze/);
+      assert.match(result.error, /bronze needs at least 2/);
     }
   });
 

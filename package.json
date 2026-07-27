@@ -11,6 +11,8 @@
     "db:migrate": "drizzle-kit migrate --config=drizzle.config.ts",
     "db:push": "drizzle-kit push --config=drizzle.config.ts",
     "db:studio": "drizzle-kit studio --config=drizzle.config.ts",
+    "test": "node --import tsx --test src/lib/**/*.test.ts",
+    "test:security": "node --import tsx --test src/lib/security/*.test.ts",
     "test:checklist": "npx tsx --test src/lib/tournaments/listing-details-checklist.test.ts"
   },
   "dependencies": {

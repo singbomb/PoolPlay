@@ -303,7 +303,19 @@ export async function removeTeamMember(teamId: string, memberId: string) {
     return { error: "Only captains or school officers can remove members" };
   }
 
-  await db.delete(teamMembers).where(eq(teamMembers.id, memberId));
+  const [removedMember] = await db
+    .delete(teamMembers)
+    .where(
+      and(
+        eq(teamMembers.id, memberId),
+        eq(teamMembers.teamId, teamId)
+      )
+    )
+    .returning({ id: teamMembers.id });
+
+  if (!removedMember) {
+    return { error: "Member not found" };
+  }
 
   revalidatePath("/teams/[slug]", "page");
   return { success: true };
@@ -357,17 +369,4 @@ export async function deleteTeam(teamId: string, confirmationName: string) {
   revalidatePath("/teams");
   revalidatePath("/admin");
   return { success: true as const };
-}
-
-export async function updateJerseyNumber(
-  memberId: string,
-  jerseyNumber: number | null
-) {
-  await db
-    .update(teamMembers)
-    .set({ jerseyNumber })
-    .where(eq(teamMembers.id, memberId));
-
-  revalidatePath("/teams");
-  return { success: true };
 }

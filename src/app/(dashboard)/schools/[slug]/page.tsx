@@ -53,6 +53,7 @@ import { SchoolRoster } from "./school-roster";
 import { VerificationControls } from "./verification-controls";
 import type { Metadata } from "next";
 import { pageMetadata } from "@/lib/metadata";
+import { canViewRosterEmail } from "@/lib/security/roster-email-visibility";
 
 interface Props {
   params: Promise<{ slug: string }>;
@@ -262,7 +263,13 @@ export default async function SchoolDetailPage({ params }: Props) {
               membershipId: m.membershipId,
               userId: m.userId,
               fullName: m.fullName,
-              email: m.email,
+              email: canViewRosterEmail({
+                viewerUserId: user.id,
+                memberUserId: m.userId,
+                canManageRoster: canRosterManage,
+              })
+                ? m.email
+                : null,
               role: m.role,
               title: m.title,
             }))}

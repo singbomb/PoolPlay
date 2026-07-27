@@ -16,24 +16,15 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { createClient } from "@supabase/supabase-js";
+import { type NextRequest } from "next/server";
+import { updateSession } from "@/lib/supabase/middleware";
 
-/** Server-only Supabase client for storage and admin operations. */
-export function createAdminClient() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  if (!url || !serviceKey) {
-    throw new Error(
-      "SUPABASE_SERVICE_ROLE_KEY is required for server admin operations."
-    );
-  }
-
-  return createClient(url, serviceKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
+export async function proxy(request: NextRequest) {
+  return await updateSession(request);
 }
 
-export const TOURNAMENT_WAIVER_BUCKET = "tournament-waivers";
-
-export const WAIVER_MAX_BYTES = 10 * 1024 * 1024;
+export const config = {
+  matcher: [
+    "/((?!_next/static|_next/image|favicon.ico|api|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
+  ],
+};

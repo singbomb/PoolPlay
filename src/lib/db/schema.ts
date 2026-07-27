@@ -177,6 +177,7 @@ export const users = pgTable("users", {
   displayEmail: text("display_email"),
   displaySchool: text("display_school"),
   role: userRoleEnum("role").default("player").notNull(),
+  disabledAt: timestamp("disabled_at", { withTimezone: true }),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });

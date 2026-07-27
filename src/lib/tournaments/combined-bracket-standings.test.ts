@@ -48,8 +48,10 @@ describe("assignBracketTiers", () => {
     const ranked = ["t1", "t2", "t3", "t4", "t5", "t6"];
     const tiers = assignBracketTiers(ranked, 2, 4, null);
     assert.equal(tiers.get("t1")?.tierName, "Gold");
-    assert.equal(tiers.get("t4")?.tierName, "Silver");
+    assert.equal(tiers.get("t4")?.tierName, "Gold");
+    assert.equal(tiers.get("t5")?.tierName, "Silver");
     assert.equal(tiers.get("t1")?.seed, 1);
-    assert.equal(tiers.get("t5")?.seed, 2);
+    assert.equal(tiers.get("t5")?.seed, 1);
+    assert.equal(tiers.get("t6")?.seed, 2);
   });
 });

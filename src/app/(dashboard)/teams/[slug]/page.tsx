@@ -41,6 +41,7 @@ import { RosterRow } from "./roster-row";
 import { TeamDeleteButton } from "./team-delete-button";
 import type { Metadata } from "next";
 import { pageMetadata } from "@/lib/metadata";
+import { canViewRosterEmail } from "@/lib/security/roster-email-visibility";
 
 interface Props {
   params: Promise<{ slug: string }>;
@@ -194,7 +195,16 @@ export default async function TeamDetailPage({ params }: Props) {
             {members.map((member) => (
               <RosterRow
                 key={member.id}
-                member={member}
+                member={{
+                  ...member,
+                  email: canViewRosterEmail({
+                    viewerUserId: user.id,
+                    memberUserId: member.userId,
+                    canManageRoster: isCaptain,
+                  })
+                    ? member.email
+                    : null,
+                }}
                 isCaptain={isCaptain}
                 teamId={id}
               />

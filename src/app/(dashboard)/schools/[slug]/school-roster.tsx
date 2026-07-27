@@ -48,7 +48,7 @@ type RosterMember = {
   membershipId: string;
   userId: string;
   fullName: string;
-  email: string;
+  email: string | null;
   role: SchoolMemberRole;
   title: string | null;
 };
@@ -314,7 +314,9 @@ function RosterRow({
     >
       <div className="min-w-0">
         <p className="font-medium">{member.fullName}</p>
-        <p className="text-sm text-muted-foreground">{member.email}</p>
+        {member.email && (
+          <p className="text-sm text-muted-foreground">{member.email}</p>
+        )}
         {member.title && (
           <p className="text-xs text-muted-foreground">{member.title}</p>
         )}

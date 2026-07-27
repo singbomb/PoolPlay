@@ -36,6 +36,7 @@ import { canScheduleMatches } from "@/lib/tournaments/permissions";
 import { getMatchTournamentId } from "@/lib/tournaments/match-query";
 import { autoScheduleMatchesWithCourtSets } from "@/lib/utils/scheduling";
 import { warmupMinutesForFormat } from "@/lib/labels/warmup-format";
+import { assertScheduledCourtBelongsToMatchTournament } from "@/lib/security/authorization-invariants";
 
 export async function autoScheduleTournament(
   tournamentId: string,
@@ -181,14 +182,40 @@ export async function updateMatchSchedule(
     return { error: "Only the organizer can update match schedules during setup." };
   }
 
-  await db
+  const [court] = await db
+    .select({ tournamentId: courts.tournamentId })
+    .from(courts)
+    .where(eq(courts.id, courtId))
+    .limit(1);
+
+  if (!court) {
+    return { error: "Resource not found or access denied" };
+  }
+
+  try {
+    assertScheduledCourtBelongsToMatchTournament({
+      matchTournamentId: tournamentId,
+      courtTournamentId: court.tournamentId,
+    });
+  } catch {
+    return { error: "Resource not found or access denied" };
+  }
+
+  const [updatedMatch] = await db
     .update(matches)
     .set({
       courtId,
       scheduledTime: new Date(scheduledTime),
       updatedAt: new Date(),
     })
-    .where(eq(matches.id, matchId));
+    .where(
+      and(eq(matches.id, matchId), eq(matches.tournamentId, tournamentId))
+    )
+    .returning({ id: matches.id });
+
+  if (!updatedMatch) {
+    return { error: "Resource not found or access denied" };
+  }
 
   revalidatePath("/schedule");
   return { success: true };

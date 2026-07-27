@@ -67,6 +67,7 @@ import {
   syncManyDivisionPools,
 } from "@/lib/tournaments/division-pools";
 import { ensureDivisionBracketSkeleton } from "@/lib/tournaments/bracket-structure";
+import { assertChildBelongsToAuthorizedParent } from "@/lib/security/authorization-invariants";
 import type { TournamentStatus } from "@/types";
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -629,7 +630,27 @@ export async function removeDivision(tournamentId: string, divisionId: string) {
     return { error: "Pools cannot be removed in the current tournament stage." };
   }
 
-  await db.delete(divisions).where(eq(divisions.id, divisionId));
+  const [removedDivision] = await db
+    .delete(divisions)
+    .where(
+      and(
+        eq(divisions.id, divisionId),
+        eq(divisions.tournamentId, tournamentId)
+      )
+    )
+    .returning({
+      id: divisions.id,
+      tournamentId: divisions.tournamentId,
+    });
+
+  if (!removedDivision) {
+    return { error: "Resource not found or access denied" };
+  }
+
+  assertChildBelongsToAuthorizedParent({
+    childParentId: removedDivision.tournamentId,
+    authorizedParentId: tournamentId,
+  });
 
   revalidatePath("/tournaments/[slug]", "page");
   return { success: true };
@@ -759,7 +780,24 @@ export async function removeCourt(tournamentId: string, courtId: string) {
     return { error: "Courts cannot be removed in the current tournament stage." };
   }
 
-  await db.delete(courts).where(eq(courts.id, courtId));
+  const [removedCourt] = await db
+    .delete(courts)
+    .where(
+      and(eq(courts.id, courtId), eq(courts.tournamentId, tournamentId))
+    )
+    .returning({
+      id: courts.id,
+      tournamentId: courts.tournamentId,
+    });
+
+  if (!removedCourt) {
+    return { error: "Resource not found or access denied" };
+  }
+
+  assertChildBelongsToAuthorizedParent({
+    childParentId: removedCourt.tournamentId,
+    authorizedParentId: tournamentId,
+  });
 
   revalidatePath("/tournaments/[slug]", "page");
   return { success: true };

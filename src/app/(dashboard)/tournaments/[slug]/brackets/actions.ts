@@ -52,6 +52,8 @@ import {
   type BracketMatchForRefs,
 } from "@/lib/tournaments/bracket-refs";
 import { validateBracketTierSettings } from "@/lib/tournaments/bracket-tiers";
+import { assertMatchBelongsToAuthorizedTournament } from "@/lib/security/authorization-invariants";
+import { getMatchTournamentId } from "@/lib/tournaments/match-query";
 
 async function assertCanAssignTeamsToPools(
   tournamentId: string,
@@ -184,14 +186,18 @@ export async function updateMatchRef(
 ) {
   const user = await requireUser();
 
-  const [tournament] = await db
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, tournamentId))
-    .limit(1);
+  const matchTournamentId = await getMatchTournamentId(matchId);
+  if (!matchTournamentId) {
+    return { error: "Resource not found or access denied" };
+  }
 
-  if (!tournament || !await resolveIsTournamentOrganizer(tournament, user)) {
-    return { error: "Only the organizer can change the working team" };
+  try {
+    assertMatchBelongsToAuthorizedTournament({
+      matchTournamentId,
+      authorizedTournamentId: tournamentId,
+    });
+  } catch {
+    return { error: "Resource not found or access denied" };
   }
 
   const [match] = await db
@@ -213,7 +219,17 @@ export async function updateMatchRef(
     .limit(1);
 
   if (!match || (!match.poolId && !match.bracketId)) {
-    return { error: "Match not found" };
+    return { error: "Resource not found or access denied" };
+  }
+
+  const [tournament] = await db
+    .select()
+    .from(tournaments)
+    .where(eq(tournaments.id, matchTournamentId))
+    .limit(1);
+
+  if (!tournament || !await resolveIsTournamentOrganizer(tournament, user)) {
+    return { error: "Only the organizer can change the working team" };
   }
 
   if (match.status === "completed") {
@@ -284,10 +300,20 @@ export async function updateMatchRef(
     }
   }
 
-  await db
+  const [updatedMatch] = await db
     .update(matches)
     .set({ refTeamId, updatedAt: new Date() })
-    .where(eq(matches.id, matchId));
+    .where(
+      and(
+        eq(matches.id, matchId),
+        eq(matches.tournamentId, matchTournamentId)
+      )
+    )
+    .returning({ id: matches.id });
+
+  if (!updatedMatch) {
+    return { error: "Resource not found or access denied" };
+  }
 
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/scoring", "page");
@@ -302,14 +328,18 @@ export async function updateBracketMatchCourt(
 ) {
   const user = await requireUser();
 
-  const [tournament] = await db
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, tournamentId))
-    .limit(1);
+  const matchTournamentId = await getMatchTournamentId(matchId);
+  if (!matchTournamentId) {
+    return { error: "Resource not found or access denied" };
+  }
 
-  if (!tournament || !await resolveIsTournamentOrganizer(tournament, user)) {
-    return { error: "Only the organizer can assign courts" };
+  try {
+    assertMatchBelongsToAuthorizedTournament({
+      matchTournamentId,
+      authorizedTournamentId: tournamentId,
+    });
+  } catch {
+    return { error: "Resource not found or access denied" };
   }
 
   const [match] = await db
@@ -323,7 +353,17 @@ export async function updateBracketMatchCourt(
     .limit(1);
 
   if (!match?.bracketId) {
-    return { error: "Bracket match not found" };
+    return { error: "Resource not found or access denied" };
+  }
+
+  const [tournament] = await db
+    .select()
+    .from(tournaments)
+    .where(eq(tournaments.id, matchTournamentId))
+    .limit(1);
+
+  if (!tournament || !await resolveIsTournamentOrganizer(tournament, user)) {
+    return { error: "Only the organizer can assign courts" };
   }
 
   if (match.status === "completed") {
@@ -341,10 +381,20 @@ export async function updateBracketMatchCourt(
     }
   }
 
-  await db
+  const [updatedMatch] = await db
     .update(matches)
     .set({ courtId, updatedAt: new Date() })
-    .where(eq(matches.id, matchId));
+    .where(
+      and(
+        eq(matches.id, matchId),
+        eq(matches.tournamentId, matchTournamentId)
+      )
+    )
+    .returning({ id: matches.id });
+
+  if (!updatedMatch) {
+    return { error: "Resource not found or access denied" };
+  }
 
   await assignBracketRefsForBracket(match.bracketId, db, {
     resetRoundOneCourtId: courtId,

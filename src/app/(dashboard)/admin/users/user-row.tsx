@@ -28,10 +28,10 @@ import {
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { TableCell, TableRow } from "@/components/ui/table";
-import { Loader2, Trash2 } from "lucide-react";
+import { Loader2, UserX } from "lucide-react";
 import { toast } from "sonner";
 import { ADMIN_SELECT_SIDE_OFFSET } from "../constants";
-import { setUserRole, adminDeleteUser } from "../actions";
+import { setUserRole, adminDisableUser } from "../actions";
 import type { UserRole } from "@/types";
 
 const ROLE_OPTIONS: { value: UserRole; label: string }[] = [
@@ -48,6 +48,7 @@ interface Props {
     email: string;
     university: string | null;
     role: UserRole;
+    disabledAt: string | null;
     createdAt: string;
   };
   isSelf: boolean;
@@ -56,8 +57,9 @@ interface Props {
 export function UserRow({ user, isSelf }: Props) {
   const [role, setRole] = useState<UserRole>(user.role);
   const [savingRole, startRoleSave] = useTransition();
-  const [deleting, startDelete] = useTransition();
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [disabling, startDisable] = useTransition();
+  const [confirmDisable, setConfirmDisable] = useState(false);
+  const [disabled, setDisabled] = useState(user.disabledAt !== null);
 
   function onRoleChange(next: string | null) {
     if (typeof next !== "string") return;
@@ -76,20 +78,31 @@ export function UserRow({ user, isSelf }: Props) {
     });
   }
 
-  function onDelete() {
-    if (!confirmDelete) {
-      setConfirmDelete(true);
-      window.setTimeout(() => setConfirmDelete(false), 4000);
+  function onDisable() {
+    if (!disabled && !confirmDisable) {
+      setConfirmDisable(true);
+      window.setTimeout(() => setConfirmDisable(false), 4000);
       return;
     }
-    startDelete(async () => {
-      const result = await adminDeleteUser(user.id);
+    startDisable(async () => {
+      const result = await adminDisableUser(user.id);
       if ("error" in result && result.error) {
         toast.error(result.error);
       } else {
-        toast.success(`Deleted ${user.fullName}`);
+        if ("authBanPending" in result && result.authBanPending) {
+          toast.warning(
+            `${user.fullName} is blocked in PoolPlay, but the login ban could not be confirmed.`
+          );
+        } else {
+          toast.success(
+            disabled
+              ? `Login ban reapplied for ${user.fullName}`
+              : `Disabled ${user.fullName}`
+          );
+        }
+        setDisabled(true);
       }
-      setConfirmDelete(false);
+      setConfirmDisable(false);
     });
   }
 
@@ -109,7 +122,11 @@ export function UserRow({ user, isSelf }: Props) {
       </TableCell>
       <TableCell>
         <div className="inline-flex items-center gap-2">
-          <Select value={role} onValueChange={onRoleChange} disabled={savingRole}>
+          <Select
+            value={role}
+            onValueChange={onRoleChange}
+            disabled={savingRole || disabled}
+          >
             <SelectTrigger size="sm" className="w-[8.5rem]">
               <SelectValue />
             </SelectTrigger>
@@ -129,17 +146,21 @@ export function UserRow({ user, isSelf }: Props) {
       <TableCell className="text-right">
         <Button
           type="button"
-          variant={confirmDelete ? "destructive" : "outline"}
+          variant={confirmDisable && !disabled ? "destructive" : "outline"}
           size="sm"
-          disabled={isSelf || deleting}
-          onClick={onDelete}
+          disabled={isSelf || disabling}
+          onClick={onDisable}
         >
-          {deleting ? (
+          {disabling ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
           ) : (
-            <Trash2 className="h-3.5 w-3.5" />
+            <UserX className="h-3.5 w-3.5" />
           )}
-          {confirmDelete ? "Confirm delete" : "Delete"}
+          {disabled
+            ? "Reapply login ban"
+            : confirmDisable
+              ? "Confirm disable"
+              : "Disable"}
         </Button>
       </TableCell>
     </TableRow>

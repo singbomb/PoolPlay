@@ -25,6 +25,7 @@ import { db } from "@/lib/db";
 import {
   schoolMembers,
   schools,
+  teamMembers,
   teams,
   users,
 } from "@/lib/db/schema";
@@ -53,6 +54,7 @@ import {
   searchSchools,
   type SchoolSearchItem,
 } from "@/lib/schools/search";
+import { assertTeamSchoolAttachmentAuthorized } from "@/lib/security/authorization-invariants";
 
 const schoolSearchSchema = z.object({
   query: z.string().max(200).optional().default(""),
@@ -619,7 +621,9 @@ export async function submitForVerification(schoolId: string) {
  * president). Used to populate the "Part of a school" picker on the team
  * create form.
  */
-export async function listManageableSchoolsForUser(userId: string) {
+export async function listManageableSchoolsForUser() {
+  const user = await requireUser();
+
   return db
     .select({
       id: schools.id,
@@ -634,7 +638,7 @@ export async function listManageableSchoolsForUser(userId: string) {
     .innerJoin(schoolMembers, eq(schoolMembers.schoolId, schools.id))
     .where(
       and(
-        eq(schoolMembers.userId, userId),
+        eq(schoolMembers.userId, user.id),
         // members cannot create teams under the school
         ne(schoolMembers.role, "member")
       )
@@ -655,8 +659,32 @@ export async function attachTeamToSchool(teamId: string, schoolId: string) {
   if (!school) return { error: "School not found" };
 
   const membership = await loadMembership(schoolId, user.id);
-  if (!canManageSchoolRoster(membership, user)) {
-    return { error: "Only school officers can link teams to a school." };
+  const [teamMembership] = await db
+    .select({ role: teamMembers.role })
+    .from(teamMembers)
+    .where(
+      and(
+        eq(teamMembers.teamId, teamId),
+        eq(teamMembers.userId, user.id)
+      )
+    )
+    .limit(1);
+  const currentSchoolMembership = team.schoolId
+    ? await loadMembership(team.schoolId, user.id)
+    : null;
+
+  try {
+    assertTeamSchoolAttachmentAuthorized({
+      canManageTeam:
+        teamMembership?.role === "captain" ||
+        canManageSchoolRoster(currentSchoolMembership, user),
+      canManageSchool: canManageSchoolRoster(membership, user),
+    });
+  } catch {
+    return {
+      error:
+        "You must be authorized to manage both the team and the destination school.",
+    };
   }
 
   await db

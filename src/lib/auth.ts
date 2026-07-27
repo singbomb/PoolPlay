@@ -87,6 +87,8 @@ export const getCurrentUser = cache(async () => {
     .limit(1);
 
   if (dbUser) {
+    if (dbUser.disabledAt) return null;
+
     // Auto-promote bootstrap admins on every login so revoking an env entry
     // does not leak access (we don't auto-demote, that stays manual).
     if (shouldBeAdmin && dbUser.role !== "admin") {

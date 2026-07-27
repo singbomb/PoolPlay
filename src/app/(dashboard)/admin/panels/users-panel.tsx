@@ -49,6 +49,7 @@ export async function AdminUsersPanel({ page }: { page: number }) {
       email: users.email,
       university: users.university,
       role: users.role,
+      disabledAt: users.disabledAt,
       createdAt: users.createdAt,
     })
     .from(users)
@@ -61,7 +62,7 @@ export async function AdminUsersPanel({ page }: { page: number }) {
       <div>
         <h2 className="text-lg font-semibold tracking-tight">Users</h2>
         <p className="text-sm text-muted-foreground">
-          Change roles or remove accounts. You are the current admin and
+          Change roles or disable account access. You are the current admin and
           can&apos;t demote yourself if you&apos;re the only one.{" "}
           <span className="text-muted-foreground/90">
             ({ADMIN_TABLE_PAGE_SIZE} users per page.)
@@ -86,6 +87,7 @@ export async function AdminUsersPanel({ page }: { page: number }) {
                 key={u.id}
                 user={{
                   ...u,
+                  disabledAt: u.disabledAt?.toISOString() ?? null,
                   createdAt: u.createdAt.toISOString(),
                 }}
                 isSelf={u.id === currentUser?.id}

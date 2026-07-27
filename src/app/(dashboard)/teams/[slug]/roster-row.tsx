@@ -30,7 +30,7 @@ interface Member {
   jerseyNumber: number | null;
   userId: string;
   fullName: string;
-  email: string;
+  email: string | null;
 }
 
 export function RosterRow({
@@ -60,7 +60,9 @@ export function RosterRow({
         )}
         <div>
           <p className="font-medium">{member.fullName}</p>
-          <p className="text-sm text-muted-foreground">{member.email}</p>
+          {member.email && (
+            <p className="text-sm text-muted-foreground">{member.email}</p>
+          )}
         </div>
       </div>
       <div className="flex items-center gap-2">
