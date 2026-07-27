@@ -18,7 +18,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import Link from "next/link";
+import Link, { useLinkStatus } from "next/link";
 import { cn } from "@/lib/utils";
 
 const TOP_LINKS = [
@@ -26,6 +26,24 @@ const TOP_LINKS = [
   { href: "/about", label: "About" },
   { href: "/dashboard", label: "Dashboard" },
 ] as const;
+
+function NavLinkContent({ label }: { label: string }) {
+  const { pending } = useLinkStatus();
+
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span>{label}</span>
+      <span
+        aria-hidden
+        className={cn(
+          "size-1.5 rounded-full bg-primary opacity-0 transition-opacity duration-150",
+          pending && "animate-pulse opacity-100"
+        )}
+      />
+      <span className="sr-only">{pending ? " loading" : ""}</span>
+    </span>
+  );
+}
 
 /** Top bar links: no route-based highlight — same muted style for every item. */
 export function HeaderNav({ className }: { className?: string }) {
@@ -38,9 +56,10 @@ export function HeaderNav({ className }: { className?: string }) {
         <Link
           key={link.href}
           href={link.href}
+          prefetch
           className="rounded-md px-2 py-1.5 text-sm font-medium text-muted-foreground transition-[color,background-color,transform] duration-200 ease-out hover:text-foreground motion-safe:hover:-translate-y-0.5 sm:px-3"
         >
-          {link.label}
+          <NavLinkContent label={link.label} />
         </Link>
       ))}
     </nav>

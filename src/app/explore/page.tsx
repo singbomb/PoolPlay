@@ -37,15 +37,17 @@ export const metadata = pageMetadata("Explore tournaments");
 export const dynamic = "force-dynamic";
 
 export default async function ExplorePage() {
-  const user = await getCurrentAuthProfile();
-
-  const allTournaments = await enrichTournamentsWithHostSchools(
-    await db
-      .select(tournamentListColumns)
-      .from(tournaments)
-      .where(ne(tournaments.status, "draft"))
-      .orderBy(desc(tournaments.date))
-  );
+  const [user, allTournaments] = await Promise.all([
+    getCurrentAuthProfile(),
+    (async () =>
+      enrichTournamentsWithHostSchools(
+        await db
+          .select(tournamentListColumns)
+          .from(tournaments)
+          .where(ne(tournaments.status, "draft"))
+          .orderBy(desc(tournaments.date))
+      ))(),
+  ]);
 
   return (
     <div className="flex min-h-screen flex-col">

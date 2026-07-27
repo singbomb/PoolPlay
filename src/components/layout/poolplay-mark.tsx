@@ -49,7 +49,7 @@ export function PoolPlayMark({
 
   if (href) {
     return (
-      <Link href={href} className={cn("shrink-0", className)}>
+      <Link href={href} prefetch className={cn("shrink-0", className)}>
         {wordmark}
       </Link>
     );
