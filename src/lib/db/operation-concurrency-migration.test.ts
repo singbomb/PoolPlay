@@ -7,7 +7,7 @@ const migrationPath = path.join(
   process.cwd(),
   "supabase",
   "migrations",
-  "20260727090000_competition_operation_concurrency.sql"
+  "20260727104441_competition_operation_concurrency.sql"
 );
 const migration = readFileSync(migrationPath, "utf8").toLowerCase();
 

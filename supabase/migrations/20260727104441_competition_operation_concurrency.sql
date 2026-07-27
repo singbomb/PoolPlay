@@ -1,6 +1,7 @@
 -- Make registration, payment, and scoring operations auditable and safe under
 -- concurrent server requests. Browser clients remain read-only; all mutations
 -- continue to use the trusted server-side Postgres connection.
+-- Production migration ledger version: 20260727104441.
 
 ALTER TABLE public.registrations
   ADD COLUMN revision integer NOT NULL DEFAULT 0;
