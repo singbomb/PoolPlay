@@ -17,6 +17,7 @@
  */
 
 import Link from "next/link";
+import { unstable_cache } from "next/cache";
 import { db } from "@/lib/db";
 import { tournaments } from "@/lib/db/schema";
 import { desc, ne } from "drizzle-orm";
@@ -36,17 +37,23 @@ export const metadata = pageMetadata("Explore tournaments");
 
 export const dynamic = "force-dynamic";
 
+const getPublicTournaments = unstable_cache(
+  async () =>
+    enrichTournamentsWithHostSchools(
+      await db
+        .select(tournamentListColumns)
+        .from(tournaments)
+        .where(ne(tournaments.status, "draft"))
+        .orderBy(desc(tournaments.date))
+    ),
+  ["public-tournaments"],
+  { revalidate: 60 }
+);
+
 export default async function ExplorePage() {
   const [user, allTournaments] = await Promise.all([
     getCurrentAuthProfile(),
-    (async () =>
-      enrichTournamentsWithHostSchools(
-        await db
-          .select(tournamentListColumns)
-          .from(tournaments)
-          .where(ne(tournaments.status, "draft"))
-          .orderBy(desc(tournaments.date))
-      ))(),
+    getPublicTournaments(),
   ]);
 
   return (

@@ -17,6 +17,7 @@
  */
 
 import { cache } from "react";
+import { cookies } from "next/headers";
 import { createClient } from "@/lib/supabase/server";
 import { db } from "@/lib/db";
 import { users } from "@/lib/db/schema";
@@ -38,6 +39,13 @@ function adminBootstrapEmails(): Set<string> {
 }
 
 export const getCurrentAuthProfile = cache(async function getCurrentAuthProfile() {
+  const cookieStore = await cookies();
+  const hasAuthCookie = cookieStore
+    .getAll()
+    .some(({ name }) => name.startsWith("sb-") && name.includes("-auth-token"));
+
+  if (!hasAuthCookie) return null;
+
   const supabase = await createClient();
   const {
     data: { user: authUser },
