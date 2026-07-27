@@ -14,10 +14,13 @@
 -- You should have received a copy of the GNU General Public License
 -- along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
--- Tournament-wide pool standings / seeding tie-break criteria.
--- Stored as an ordered JSON array of keys.
-ALTER TABLE public.tournaments
-  ADD COLUMN IF NOT EXISTS pool_tiebreak_criteria jsonb
-    NOT NULL
-    DEFAULT '["match_record","set_record","point_diff","head_to_head"]'::jsonb;
+-- Additional team/tournament regions (enum values are append-only in Postgres).
 
+ALTER TYPE team_region ADD VALUE IF NOT EXISTS 'northeast';
+ALTER TYPE team_region ADD VALUE IF NOT EXISTS 'northwest';
+ALTER TYPE team_region ADD VALUE IF NOT EXISTS 'east_central';
+
+-- East and West regions.
+
+ALTER TYPE team_region ADD VALUE IF NOT EXISTS 'east';
+ALTER TYPE team_region ADD VALUE IF NOT EXISTS 'west';

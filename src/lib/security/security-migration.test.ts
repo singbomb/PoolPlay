@@ -23,15 +23,15 @@ import { describe, it } from "node:test";
 
 const SECURITY_MIGRATION_PATH = resolve(
   process.cwd(),
-  "supabase/migrations/00036_security_hardening.sql"
+  "supabase/migrations/20260727070145_security_hardening.sql"
 );
 const RLS_HELPER_MIGRATION_PATH = resolve(
   process.cwd(),
-  "supabase/migrations/00037_rls_helper_hardening.sql"
+  "supabase/migrations/20260727071941_rls_helper_hardening.sql"
 );
 const BROWSER_RLS_LOCKDOWN_MIGRATION_PATH = resolve(
   process.cwd(),
-  "supabase/migrations/00038_browser_rls_lockdown.sql"
+  "supabase/migrations/20260727074224_browser_rls_lockdown.sql"
 );
 const BROWSER_ROLES = ["anon", "authenticated"] as const;
 const WRITE_PRIVILEGES = ["insert", "update", "delete"] as const;

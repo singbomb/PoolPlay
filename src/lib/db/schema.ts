@@ -152,14 +152,14 @@ export const volleyballPositionEnum = pgEnum("volleyball_position", [
 
 export const teamRegionEnum = pgEnum("team_region", [
   "north",
-  "northeast",
-  "east",
-  "east_central",
   "central",
   "south",
   "southeast",
-  "west",
+  "northeast",
   "northwest",
+  "east_central",
+  "east",
+  "west",
 ]);
 
 // ── Tables ──────────────────────────────────────────────────────────────────
@@ -247,7 +247,7 @@ export const teams = pgTable("teams", {
   verificationStatus: teamVerificationStatusEnum("verification_status")
     .default("pending")
     .notNull(),
-  verifiedAt: timestamp("verified_at"),
+  verifiedAt: timestamp("verified_at", { withTimezone: true }),
   verifiedByUserId: uuid("verified_by_user_id").references(() => users.id, {
     onDelete: "set null",
   }),
@@ -332,9 +332,13 @@ export const tournaments = pgTable("tournaments", {
   /** Teams that advance into silver when bracketCount is 3; remainder to bronze. */
   silverTeamCount: integer("silver_team_count"),
   /** Set when the organizer saves Pool settings on the Pools tab. */
-  poolSettingsSavedAt: timestamp("pool_settings_saved_at"),
+  poolSettingsSavedAt: timestamp("pool_settings_saved_at", {
+    withTimezone: true,
+  }),
   /** Set when the organizer saves Bracket settings on the Bracket tab. */
-  bracketSettingsSavedAt: timestamp("bracket_settings_saved_at"),
+  bracketSettingsSavedAt: timestamp("bracket_settings_saved_at", {
+    withTimezone: true,
+  }),
   /**
    * Logistics for the downloadable tournament packet (parking, check-in, agenda,
    * payment, contact). Competition rules are auto-filled from settings.
@@ -386,7 +390,7 @@ export const divisions = pgTable("divisions", {
   /** Teams that advance into silver when bracketCount is 3; remainder to bronze. */
   silverTeamCount: integer("silver_team_count"),
   /** When set, non-host users can view pool play and brackets for this pool. */
-  poolsReleasedAt: timestamp("pools_released_at"),
+  poolsReleasedAt: timestamp("pools_released_at", { withTimezone: true }),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
@@ -434,17 +438,21 @@ export const registrationPayments = pgTable("registration_payments", {
   submittedByUserId: uuid("submitted_by_user_id").references(() => users.id, {
     onDelete: "set null",
   }),
-  submittedAt: timestamp("submitted_at"),
+  submittedAt: timestamp("submitted_at", { withTimezone: true }),
   confirmedByUserId: uuid("confirmed_by_user_id").references(() => users.id, {
     onDelete: "set null",
   }),
-  confirmedAt: timestamp("confirmed_at"),
+  confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
   waivedByUserId: uuid("waived_by_user_id").references(() => users.id, {
     onDelete: "set null",
   }),
-  waivedAt: timestamp("waived_at"),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
-  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  waivedAt: timestamp("waived_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
 });
 
 export const tournamentWaivers = pgTable(
@@ -460,7 +468,9 @@ export const tournamentWaivers = pgTable(
     uploadedByUserId: uuid("uploaded_by_user_id").references(() => users.id, {
       onDelete: "set null",
     }),
-    uploadedAt: timestamp("uploaded_at").defaultNow().notNull(),
+    uploadedAt: timestamp("uploaded_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
   },
   (t) => [
     uniqueIndex("tournament_waivers_tournament_version_unique").on(
@@ -488,7 +498,9 @@ export const waiverCompletions = pgTable(
       .notNull(),
     method: waiverCompletionMethodEnum("method").notNull(),
     signedName: text("signed_name"),
-    completedAt: timestamp("completed_at").defaultNow().notNull(),
+    completedAt: timestamp("completed_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
     attestedByUserId: uuid("attested_by_user_id").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -520,7 +532,9 @@ export const tournamentEmailSends = pgTable("tournament_email_sends", {
   skippedNoCaptainCount: integer("skipped_no_captain_count")
     .default(0)
     .notNull(),
-  sentAt: timestamp("sent_at").defaultNow().notNull(),
+  sentAt: timestamp("sent_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
 });
 
 export const tournamentChatChannels = pgTable(
@@ -531,7 +545,9 @@ export const tournamentChatChannels = pgTable(
       .references(() => tournaments.id, { onDelete: "cascade" })
       .notNull(),
     kind: tournamentChatChannelKindEnum("kind").notNull(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
   },
   (t) => [
     uniqueIndex("tournament_chat_channels_tournament_kind_unique").on(
@@ -558,7 +574,9 @@ export const tournamentChatMessages = pgTable(
       onDelete: "set null",
     }),
     body: text("body").notNull(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
   }
 );
 
@@ -571,7 +589,9 @@ export const tournamentChatReadCursors = pgTable(
     channelId: uuid("channel_id")
       .references(() => tournamentChatChannels.id, { onDelete: "cascade" })
       .notNull(),
-    lastReadAt: timestamp("last_read_at").defaultNow().notNull(),
+    lastReadAt: timestamp("last_read_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
   },
   (t) => [
     primaryKey({ columns: [t.userId, t.channelId] }),
