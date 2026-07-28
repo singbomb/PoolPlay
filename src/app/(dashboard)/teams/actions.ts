@@ -34,6 +34,10 @@ import { createTeamSchema } from "@/lib/validators";
 import { flagBlockedContent } from "@/lib/admin/content-flags";
 import { slugify, uniqueSlug } from "@/lib/utils/slug";
 import { isSchoolOfficerOrAbove } from "@/lib/schools/permissions";
+import {
+  invalidatePublicTournamentCachesByIds,
+  publicTournamentIdsForTeam,
+} from "@/lib/tournaments/public-cache-invalidation";
 import type { SchoolMemberRole } from "@/types";
 
 /**
@@ -360,6 +364,7 @@ export async function deleteTeam(teamId: string, confirmationName: string) {
     return { error: "Only team captains or school officers can delete this team" };
   }
 
+  const tournamentIds = await publicTournamentIdsForTeam(teamId);
   try {
     await db.delete(teams).where(eq(teams.id, teamId));
   } catch {
@@ -368,5 +373,6 @@ export async function deleteTeam(teamId: string, confirmationName: string) {
 
   revalidatePath("/teams");
   revalidatePath("/admin");
+  await invalidatePublicTournamentCachesByIds(tournamentIds);
   return { success: true as const };
 }

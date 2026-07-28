@@ -29,7 +29,8 @@ import { UserMenu } from "@/components/layout/user-menu";
 import { getCurrentAuthProfile } from "@/lib/auth";
 import { TournamentGrid } from "@/components/tournament-grid";
 import { enrichTournamentsWithHostSchools } from "@/lib/tournaments/host-school";
-import { tournamentListColumns } from "@/lib/tournaments/list-columns";
+import { PUBLIC_TOURNAMENTS_CACHE_TAG } from "@/lib/tournaments/public-cache";
+import { buildPublicTournamentListProjection } from "@/lib/tournaments/public-projection";
 import { pageMetadata } from "@/lib/metadata";
 import { PublicSiteFooter } from "@/components/layout/public-site-footer";
 
@@ -37,17 +38,31 @@ export const metadata = pageMetadata("Explore tournaments");
 
 export const dynamic = "force-dynamic";
 
+const publicTournamentListColumns = {
+  slug: tournaments.slug,
+  name: tournaments.name,
+  description: tournaments.description,
+  location: tournaments.location,
+  date: tournaments.date,
+  status: tournaments.status,
+  gender: tournaments.gender,
+  region: tournaments.region,
+  hostSchoolId: tournaments.hostSchoolId,
+};
+
 const getPublicTournaments = unstable_cache(
   async () =>
-    enrichTournamentsWithHostSchools(
-      await db
-        .select(tournamentListColumns)
-        .from(tournaments)
-        .where(ne(tournaments.status, "draft"))
-        .orderBy(desc(tournaments.date))
+    buildPublicTournamentListProjection(
+      await enrichTournamentsWithHostSchools(
+        await db
+          .select(publicTournamentListColumns)
+          .from(tournaments)
+          .where(ne(tournaments.status, "draft"))
+          .orderBy(desc(tournaments.date))
+      )
     ),
   ["public-tournaments"],
-  { revalidate: 60 }
+  { revalidate: 60, tags: [PUBLIC_TOURNAMENTS_CACHE_TAG] }
 );
 
 export default async function ExplorePage() {
@@ -106,6 +121,7 @@ export default async function ExplorePage() {
           <TournamentGrid
             tournaments={allTournaments}
             linkPrefix="/explore/tournaments"
+            linkHostSchools={false}
           />
         </div>
       </main>

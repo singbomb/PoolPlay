@@ -47,6 +47,7 @@ import {
 import { transitionMatchLifecycleTransactional } from "@/lib/tournaments/score-operation-support";
 import { isTournamentArchived } from "@/lib/tournament-status";
 import { loadLockedTournamentForOrganizer } from "@/lib/tournaments/locked-tournament-authorization";
+import { invalidatePublicTournamentCachesByIds } from "@/lib/tournaments/public-cache-invalidation";
 
 type MatchRow = typeof matches.$inferSelect;
 type TournamentRow = typeof tournaments.$inferSelect;
@@ -130,7 +131,7 @@ async function changeMatchLifecycle(
   action: "warmup" | "start" | "pause"
 ) {
   const gate = await assertCanControlMatch(matchId);
-  if (gate.error || !gate.user) {
+  if (gate.error || !gate.user || !gate.tournament) {
     return { error: gate.error };
   }
 
@@ -141,6 +142,11 @@ async function changeMatchLifecycle(
       expectedRevision,
       actorUserId: gate.user.id,
     });
+    if (action !== "warmup") {
+      await invalidatePublicTournamentCachesByIds([gate.tournament.id], {
+        listing: true,
+      });
+    }
     revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
     revalidatePath("/tournaments/[slug]", "page");
     return { success: true as const, nextRevision: result.nextRevision };
@@ -197,7 +203,7 @@ export async function saveSetScore(formData: FormData) {
   } = parsed.data;
 
   const gate = await assertCanControlMatch(matchId);
-  if (gate.error || !gate.match || !gate.user) {
+  if (gate.error || !gate.match || !gate.user || !gate.tournament) {
     return { error: gate.error };
   }
 
@@ -211,6 +217,9 @@ export async function saveSetScore(formData: FormData) {
       actorUserId: gate.user.id,
     });
 
+    await invalidatePublicTournamentCachesByIds([gate.tournament.id], {
+      listing: true,
+    });
     revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
     revalidatePath("/tournaments/[slug]", "page");
     return {
@@ -229,7 +238,7 @@ export async function finalizeMatch(
   expectedRevision: number
 ) {
   const gate = await assertCanControlMatch(matchId);
-  if (gate.error || !gate.match || !gate.user) {
+  if (gate.error || !gate.match || !gate.user || !gate.tournament) {
     return { error: gate.error };
   }
 
@@ -241,6 +250,9 @@ export async function finalizeMatch(
       actorUserId: gate.user.id,
     });
 
+    await invalidatePublicTournamentCachesByIds([gate.tournament.id], {
+      listing: true,
+    });
     revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
     revalidatePath("/tournaments/[slug]", "page");
     return { success: true as const, nextRevision: result.nextRevision };
@@ -256,7 +268,9 @@ export async function reopenMatch(
   reason: string
 ) {
   const gate = await assertCanControlMatch(matchId);
-  if (gate.error || !gate.match || !gate.user) return { error: gate.error };
+  if (gate.error || !gate.match || !gate.user || !gate.tournament) {
+    return { error: gate.error };
+  }
   if (!gate.isOrganizer) {
     return { error: "Only the host can reopen a completed match." };
   }
@@ -278,6 +292,9 @@ export async function reopenMatch(
       reason: correctionReason,
     });
 
+    await invalidatePublicTournamentCachesByIds([gate.tournament.id], {
+      listing: true,
+    });
     revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
     revalidatePath("/tournaments/[slug]", "page");
     return {
@@ -296,6 +313,7 @@ export async function updateMatchScheduledTime(
   isoTime: string | null
 ) {
   const user = await requireUser();
+  let tournamentId: string;
 
   let scheduledTime: Date | null = null;
   if (isoTime) {
@@ -366,14 +384,16 @@ export async function updateMatchScheduledTime(
           resetRoundOneCourtId: match.courtId,
         });
       }
-      return { success: true as const };
+      return { success: true as const, tournamentId: tournament.id };
     });
     if ("error" in result) return result;
+    tournamentId = result.tournamentId;
   } catch (error) {
     console.error("Could not update the match start time", error);
     return { error: "Could not update the match start time." };
   }
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath(`/tournaments/[slug]/matches/[matchSlug]`, "page");
   revalidatePath("/tournaments/[slug]", "page");
   return { success: true as const };

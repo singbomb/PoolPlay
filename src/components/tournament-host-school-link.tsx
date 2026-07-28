@@ -42,7 +42,7 @@ export function TournamentHostSchoolLink({
   const content = (
     <>
       <Building2 className="h-3 w-3 shrink-0" />
-      <span>Hosted by {school.name}</span>
+      <span className="min-w-0 truncate">Hosted by {school.name}</span>
       {school.verificationStatus === "verified" && (
         <CheckCircle2 className="h-3 w-3 shrink-0 text-success" />
       )}

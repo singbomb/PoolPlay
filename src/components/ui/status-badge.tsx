@@ -21,7 +21,7 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import {
   isTournamentArchived,
-  statusBadgeLabel,
+  tournamentStatusLabel,
 } from "@/lib/tournament-status";
 import { formatRegistrationStatusLabel } from "@/lib/labels/registration";
 import { formatMatchStatusLabel } from "@/lib/labels/match";
@@ -132,19 +132,29 @@ interface StatusBadgeProps {
   status: string;
   /** Tournament date (YYYY-MM-DD) — required for `tournament` to derive "archived". */
   date?: string;
+  /** Explicit lifecycle result for callers that already resolved the viewer date. */
+  archived?: boolean;
   className?: string;
 }
 
-export function StatusBadge({ kind, status, date, className }: StatusBadgeProps) {
+export function StatusBadge({
+  kind,
+  status,
+  date,
+  archived: archivedOverride,
+  className,
+}: StatusBadgeProps) {
   const archived =
-    kind === "tournament" && date ? isTournamentArchived(date) : false;
+    kind === "tournament"
+      ? (archivedOverride ?? (date ? isTournamentArchived(date) : false))
+      : false;
 
   let tone: Tone;
   let label: string;
   switch (kind) {
     case "tournament":
       tone = tournamentTone(status, archived);
-      label = statusBadgeLabel(status, date ?? "");
+      label = archived ? "Archived" : tournamentStatusLabel(status);
       break;
     case "registration":
       tone = registrationTone(status);

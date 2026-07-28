@@ -35,6 +35,7 @@ import {
   OperationValidationError,
 } from "@/lib/tournaments/competition-operation-rules";
 import { transitionMatchLifecycleTransactional } from "@/lib/tournaments/score-operation-support";
+import { invalidatePublicTournamentCachesByIds } from "@/lib/tournaments/public-cache-invalidation";
 
 function competitionOperationError(error: unknown): string {
   if (
@@ -97,7 +98,9 @@ export async function updateScore(formData: FormData) {
   } = parsed.data;
 
   const gate = await assertCanScoreMatch(matchId);
-  if (gate.error || !gate.user) return { error: gate.error };
+  if (gate.error || !gate.user || !gate.tournament) {
+    return { error: gate.error };
+  }
 
   try {
     const result = await saveSetScoreTransactional({
@@ -109,6 +112,9 @@ export async function updateScore(formData: FormData) {
       actorUserId: gate.user.id,
     });
 
+    await invalidatePublicTournamentCachesByIds([gate.tournament.id], {
+      listing: true,
+    });
     revalidatePath(`/tournaments/[slug]/scoring`, "page");
     revalidatePath("/tournaments/[slug]", "page");
     return {
@@ -127,7 +133,9 @@ export async function finalizeMatch(
   expectedRevision: number
 ) {
   const gate = await assertCanScoreMatch(matchId);
-  if (gate.error || !gate.user) return { error: gate.error };
+  if (gate.error || !gate.user || !gate.tournament) {
+    return { error: gate.error };
+  }
 
   try {
     const result = await finalizeMatchTransactional({
@@ -137,6 +145,9 @@ export async function finalizeMatch(
       actorUserId: gate.user.id,
     });
 
+    await invalidatePublicTournamentCachesByIds([gate.tournament.id], {
+      listing: true,
+    });
     revalidatePath(`/tournaments/[slug]/scoring`, "page");
     revalidatePath("/tournaments/[slug]", "page");
     return { success: true as const, nextRevision: result.nextRevision };
@@ -147,7 +158,9 @@ export async function finalizeMatch(
 
 export async function startMatch(matchId: string, expectedRevision: number) {
   const gate = await assertCanScoreMatch(matchId);
-  if (gate.error || !gate.user) return { error: gate.error };
+  if (gate.error || !gate.user || !gate.tournament) {
+    return { error: gate.error };
+  }
 
   try {
     const result = await transitionMatchLifecycleTransactional({
@@ -155,6 +168,9 @@ export async function startMatch(matchId: string, expectedRevision: number) {
       action: "start",
       expectedRevision,
       actorUserId: gate.user.id,
+    });
+    await invalidatePublicTournamentCachesByIds([gate.tournament.id], {
+      listing: true,
     });
     revalidatePath(`/tournaments/[slug]/scoring`, "page");
     revalidatePath("/tournaments/[slug]", "page");

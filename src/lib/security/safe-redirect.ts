@@ -16,7 +16,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/** Reject protocol-relative and off-site redirect targets from auth callbacks. */
+const REDIRECT_VALIDATION_ORIGIN = "https://poolplay.invalid";
+const ASCII_CONTROL_OR_SPACE = /[\u0000-\u0020\u007f]/;
+
+/** Reject any target that browser URL parsing could resolve off-site. */
 export function safeRedirectPath(
   next: string | null | undefined,
   fallback = "/dashboard"
@@ -24,11 +27,32 @@ export function safeRedirectPath(
   if (!next) return fallback;
   if (
     !next.startsWith("/") ||
-    next.startsWith("//") ||
-    next.includes(":") ||
+    ASCII_CONTROL_OR_SPACE.test(next) ||
     next.includes("\\")
   ) {
     return fallback;
   }
-  return next;
+  try {
+    const destination = new URL(next, REDIRECT_VALIDATION_ORIGIN);
+    if (destination.origin !== REDIRECT_VALIDATION_ORIGIN) return fallback;
+    return `${destination.pathname}${destination.search}${destination.hash}`;
+  } catch {
+    return fallback;
+  }
+}
+
+/** Preserve the normal login landing page unless a safe local target is given. */
+export function loginRedirectPath(next: string | null | undefined): string {
+  return safeRedirectPath(next, "/dashboard?welcome=1");
+}
+
+/** Add a validated local destination to an auth page without changing its default. */
+export function pathWithSafeNext(
+  path: string,
+  next: string | null | undefined
+): string {
+  const safeNext = safeRedirectPath(next, "");
+  if (!safeNext) return path;
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}next=${encodeURIComponent(safeNext)}`;
 }

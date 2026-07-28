@@ -18,8 +18,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useState, useTransition, type FormEvent } from "react";
+import { Suspense, useState, useTransition, type FormEvent } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -33,8 +34,19 @@ import {
 } from "@/components/ui/card";
 import { PoolPlayMark } from "@/components/layout/poolplay-mark";
 import { signup } from "../actions";
+import { pathWithSafeNext, safeRedirectPath } from "@/lib/security/safe-redirect";
 
 export default function SignupPage() {
+  return (
+    <Suspense>
+      <SignupPageContent />
+    </Suspense>
+  );
+}
+
+function SignupPageContent() {
+  const searchParams = useSearchParams();
+  const next = safeRedirectPath(searchParams.get("next"), "") || null;
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
 
@@ -93,6 +105,7 @@ export default function SignupPage() {
         </CardHeader>
         <CardContent>
           <form onSubmit={onSubmit} className="space-y-4" aria-busy={isPending}>
+            {next ? <input type="hidden" name="next" value={next} /> : null}
             <div className="space-y-2">
               <Label htmlFor="fullName">Full Name</Label>
               <Input
@@ -156,7 +169,7 @@ export default function SignupPage() {
           <p className="mt-4 text-center text-sm text-muted-foreground">
             Already have an account?{" "}
             <Link
-              href="/login"
+              href={pathWithSafeNext("/login", next)}
               className="font-medium text-primary underline-offset-4 hover:underline"
             >
               Sign in

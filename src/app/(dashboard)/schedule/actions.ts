@@ -43,6 +43,7 @@ import {
 import { warmupMinutesForFormat } from "@/lib/labels/warmup-format";
 import { loadLockedTournamentForOrganizer } from "@/lib/tournaments/locked-tournament-authorization";
 import { isTournamentArchived } from "@/lib/tournament-status";
+import { invalidatePublicTournamentCachesByIds } from "@/lib/tournaments/public-cache-invalidation";
 
 type DbClient = typeof db;
 
@@ -319,6 +320,7 @@ export async function autoScheduleTournament(
     };
   }
   if ("error" in result) return { ...result, scheduled: 0 };
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/schedule");
   return result;
@@ -330,6 +332,7 @@ export async function updateMatchSchedule(
   scheduledTime: string
 ) {
   const user = await requireUser();
+  let changedTournamentId = "";
   const nextScheduledTime = new Date(scheduledTime);
   if (!Number.isFinite(nextScheduledTime.getTime())) {
     return { error: "Choose a valid match time." };
@@ -416,15 +419,17 @@ export async function updateMatchSchedule(
         )
         .returning({ id: matches.id });
       return updatedMatch
-        ? { success: true as const }
+        ? { success: true as const, tournamentId: tournament.id }
         : { error: "Resource not found or access denied" };
     });
     if ("error" in result) return result;
+    changedTournamentId = result.tournamentId;
   } catch (error) {
     console.error("Failed to update match schedule", error);
     return { error: "Unable to update the match schedule." };
   }
 
+  await invalidatePublicTournamentCachesByIds([changedTournamentId]);
   revalidatePath("/schedule");
   return { success: true };
 }

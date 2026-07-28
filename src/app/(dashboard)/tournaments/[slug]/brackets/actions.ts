@@ -56,6 +56,7 @@ import {
   OperationConflictError,
   OperationValidationError,
 } from "@/lib/tournaments/competition-operation-rules";
+import { invalidatePublicTournamentCachesByIds } from "@/lib/tournaments/public-cache-invalidation";
 
 type BracketActionDbClient = typeof db;
 
@@ -185,6 +186,7 @@ export async function updatePoolSeeding(
     };
   }
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
   return {
@@ -208,6 +210,7 @@ export async function updateEliminationSeeding(
     return { error: "Need at least 2 teams to set seeding" };
   }
 
+  let matchCount = 0;
   try {
     const result = await db.transaction(async (tx) => {
       const executor = tx as unknown as BracketActionDbClient;
@@ -268,13 +271,7 @@ export async function updateEliminationSeeding(
       );
     });
     if ("error" in result) return { error: result.error };
-
-    revalidatePath("/tournaments/[slug]", "page");
-    revalidatePath("/tournaments/[slug]/brackets", "page");
-    return {
-      success: true as const,
-      matchCount: result.matchCount,
-    };
+    matchCount = result.matchCount;
   } catch (error) {
     return {
       error: bracketOperationError(
@@ -283,6 +280,14 @@ export async function updateEliminationSeeding(
       ),
     };
   }
+
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
+  revalidatePath("/tournaments/[slug]", "page");
+  revalidatePath("/tournaments/[slug]/brackets", "page");
+  return {
+    success: true as const,
+    matchCount,
+  };
 }
 
 /** Override the auto-assigned working/ref team for a pool or bracket match. */
@@ -519,6 +524,7 @@ export async function updateBracketMatchCourt(
     return { error: "Could not assign the bracket court" };
   }
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/schedule");
   return { success: true as const };
@@ -690,6 +696,7 @@ export async function updateTournamentBracketSettings(
     };
   }
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   return {
     success: true as const,
@@ -737,6 +744,7 @@ export async function regenerateTournamentBrackets(tournamentId: string) {
     };
   }
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   return { success: true as const };
 }

@@ -105,7 +105,6 @@ const WHEEL_DELTA_PER_DATE = 120;
 const SWIPE_THRESHOLD_PX = 56;
 
 interface Tournament {
-  id: string;
   slug: string;
   name: string;
   description: string | null;
@@ -155,9 +154,11 @@ function groupByDate(list: Tournament[]): DateGroup[] {
 function TournamentRow({
   tournament: t,
   linkPrefix,
+  linkHostSchools,
 }: {
   tournament: Tournament;
   linkPrefix: string;
+  linkHostSchools: boolean;
 }) {
   return (
     <div className="min-w-0 max-w-full px-1 py-3.5 transition-colors duration-150 hover:bg-muted/40">
@@ -182,7 +183,10 @@ function TournamentRow({
       </Link>
       <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
         <TeamAttributesBadges gender={t.gender} region={t.region} />
-        <TournamentHostSchoolLink school={t.hostSchool} />
+        <TournamentHostSchoolLink
+          school={t.hostSchool}
+          asLink={linkHostSchools}
+        />
       </div>
     </div>
   );
@@ -199,11 +203,13 @@ function TournamentRow({
 function ChronologicalSchedule({
   tournaments,
   linkPrefix,
+  linkHostSchools,
   selectedDate,
   onSelectedDateChange,
 }: {
   tournaments: Tournament[];
   linkPrefix: string;
+  linkHostSchools: boolean;
   selectedDate: string;
   onSelectedDateChange: (date: string) => void;
 }) {
@@ -457,9 +463,10 @@ function ChronologicalSchedule({
                       <div className={cn("list-stack w-full border-t border-border/70", SELECTED_PANEL_MIN_H)}>
                         {group.tournaments.map((t) => (
                           <TournamentRow
-                            key={t.id}
+                            key={t.slug}
                             tournament={t}
                             linkPrefix={linkPrefix}
+                            linkHostSchools={linkHostSchools}
                           />
                         ))}
                       </div>
@@ -493,9 +500,11 @@ function ChronologicalSchedule({
 export function TournamentGrid({
   tournaments,
   linkPrefix = "/tournaments",
+  linkHostSchools = true,
 }: {
   tournaments: Tournament[];
   linkPrefix?: string;
+  linkHostSchools?: boolean;
 }) {
   const [query, setQuery] = useState("");
   const [genderFilter, setGenderFilter] = useState<Set<TeamGender>>(
@@ -701,6 +710,7 @@ export function TournamentGrid({
         <ChronologicalSchedule
           tournaments={filtered}
           linkPrefix={linkPrefix}
+          linkHostSchools={linkHostSchools}
           selectedDate={selectedDate}
           onSelectedDateChange={setSelectedDate}
         />

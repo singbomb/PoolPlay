@@ -34,6 +34,7 @@ import {
 } from "@/components/ui/card";
 import { PoolPlayMark } from "@/components/layout/poolplay-mark";
 import { login } from "../actions";
+import { pathWithSafeNext, safeRedirectPath } from "@/lib/security/safe-redirect";
 
 export default function LoginPage() {
   return (
@@ -46,6 +47,7 @@ export default function LoginPage() {
 function LoginPageContent() {
   const searchParams = useSearchParams();
   const resetSuccess = searchParams.get("reset") === "success";
+  const next = safeRedirectPath(searchParams.get("next"), "") || null;
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
 
@@ -102,6 +104,7 @@ function LoginPageContent() {
         </CardHeader>
         <CardContent>
           <form onSubmit={onSubmit} className="space-y-4" aria-busy={isPending}>
+            {next ? <input type="hidden" name="next" value={next} /> : null}
             <div className="space-y-2">
               <Label htmlFor="email">Email</Label>
               <Input
@@ -118,7 +121,7 @@ function LoginPageContent() {
               <div className="flex items-center justify-between gap-2">
                 <Label htmlFor="password">Password</Label>
                 <Link
-                  href="/forgot-password"
+                  href={pathWithSafeNext("/forgot-password", next)}
                   className="text-xs font-medium text-primary underline-offset-4 hover:underline"
                 >
                   Forgot password?
@@ -156,7 +159,7 @@ function LoginPageContent() {
           <p className="mt-4 text-center text-sm text-muted-foreground">
             Don&apos;t have an account?{" "}
             <Link
-              href="/signup"
+              href={pathWithSafeNext("/signup", next)}
               className="font-medium text-primary underline-offset-4 hover:underline"
             >
               Sign up

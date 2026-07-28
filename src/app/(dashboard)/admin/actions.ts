@@ -36,6 +36,12 @@ import {
 import { requireAdmin } from "@/lib/auth";
 import { slugify, uniqueSlug } from "@/lib/utils/slug";
 import { flagBlockedContent } from "@/lib/admin/content-flags";
+import {
+  invalidatePublicTournamentCaches,
+  invalidatePublicTournamentCachesByIds,
+  publicTournamentIdsForSchool,
+  publicTournamentIdsForTeam,
+} from "@/lib/tournaments/public-cache-invalidation";
 import { createAdminClient } from "@/lib/supabase/admin";
 import type { UserRole, TournamentStatus } from "@/types";
 
@@ -134,38 +140,63 @@ export async function adminRenameTournament(
   ]);
   if (contentError) return { error: contentError };
 
-  const [tournament] = await db
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, tournamentId))
-    .limit(1);
-  if (!tournament) return { error: "Tournament not found" };
-
-  if (trimmed === tournament.name.trim()) {
-    return { success: true as const, slug: tournament.slug };
+  let renameResult;
+  try {
+    renameResult = await db.transaction(async (tx) => {
+      const [tournament] = await tx
+        .select()
+        .from(tournaments)
+        .where(eq(tournaments.id, tournamentId))
+        .for("update")
+        .limit(1);
+      if (!tournament) {
+        return { ok: false as const, error: "Tournament not found" };
+      }
+      if (trimmed === tournament.name.trim()) {
+        return {
+          ok: true as const,
+          changed: false as const,
+          oldSlug: tournament.slug,
+          newSlug: tournament.slug,
+        };
+      }
+      const otherSlugs = await tx
+        .select({ slug: tournaments.slug })
+        .from(tournaments)
+        .where(ne(tournaments.id, tournamentId));
+      const newSlug = uniqueSlug(
+        slugify(trimmed, "tournament"),
+        otherSlugs.map((row) => row.slug)
+      );
+      await tx
+        .update(tournaments)
+        .set({ name: trimmed, slug: newSlug, updatedAt: new Date() })
+        .where(eq(tournaments.id, tournamentId));
+      return {
+        ok: true as const,
+        changed: true as const,
+        oldSlug: tournament.slug,
+        newSlug,
+      };
+    });
+  } catch {
+    return { error: "Could not rename this tournament. Try again." };
   }
-
-  const base = slugify(trimmed, "tournament");
-  const otherSlugs = await db
-    .select({ slug: tournaments.slug })
-    .from(tournaments)
-    .where(ne(tournaments.id, tournamentId));
-  const newSlug = uniqueSlug(
-    base,
-    otherSlugs.map((r) => r.slug)
-  );
-
-  await db
-    .update(tournaments)
-    .set({ name: trimmed, slug: newSlug, updatedAt: new Date() })
-    .where(eq(tournaments.id, tournamentId));
+  if (!renameResult.ok) return { error: renameResult.error };
+  if (!renameResult.changed) {
+    return { success: true as const, slug: renameResult.newSlug };
+  }
 
   revalidatePath("/admin");
   revalidatePath("/tournaments");
   revalidatePath("/explore");
+  invalidatePublicTournamentCaches(
+    [renameResult.oldSlug, renameResult.newSlug],
+    { listing: true }
+  );
   revalidatePath("/tournaments/[slug]", "page");
 
-  return { success: true as const, slug: newSlug };
+  return { success: true as const, slug: renameResult.newSlug };
 }
 
 export async function adminUpdateTournamentStatus(
@@ -182,6 +213,14 @@ export async function adminUpdateTournamentStatus(
   ];
   if (!allowed.includes(status)) return { error: "Invalid status" };
 
+  const [tournament] = await db
+    .select({ status: tournaments.status })
+    .from(tournaments)
+    .where(eq(tournaments.id, tournamentId))
+    .limit(1);
+  if (!tournament) return { error: "Tournament not found" };
+  if (tournament.status === status) return { success: true as const };
+
   await db
     .update(tournaments)
     .set({ status, updatedAt: new Date() })
@@ -189,16 +228,22 @@ export async function adminUpdateTournamentStatus(
 
   revalidatePath("/admin");
   revalidatePath("/tournaments/[slug]", "page");
+  revalidatePath("/explore");
+  revalidatePath("/explore/tournaments/[slug]", "page");
+  await invalidatePublicTournamentCachesByIds([tournamentId], {
+    listing: true,
+  });
   return { success: true as const };
 }
 
 export async function adminDeleteTournament(tournamentId: string) {
   const admin = await requireAdmin();
+  let deletedSlug = "";
 
   try {
-    await db.transaction(async (tx) => {
+    deletedSlug = await db.transaction(async (tx) => {
       const [lockedTournament] = await tx
-        .select({ id: tournaments.id })
+        .select({ id: tournaments.id, slug: tournaments.slug })
         .from(tournaments)
         .where(eq(tournaments.id, tournamentId))
         .for("update")
@@ -256,6 +301,7 @@ export async function adminDeleteTournament(tournamentId: string) {
       }
 
       await tx.delete(tournaments).where(eq(tournaments.id, tournamentId));
+      return lockedTournament.slug;
     });
   } catch {
     return { error: "Could not delete tournament. Try again." };
@@ -265,6 +311,7 @@ export async function adminDeleteTournament(tournamentId: string) {
   revalidatePath("/admin");
   revalidatePath("/tournaments");
   revalidatePath("/explore");
+  invalidatePublicTournamentCaches([deletedSlug], { listing: true });
   return { success: true as const };
 }
 
@@ -304,10 +351,12 @@ export async function adminRenameTeam(teamId: string, rawName: string) {
     .update(teams)
     .set({ name: trimmed, slug: newSlug, updatedAt: new Date() })
     .where(eq(teams.id, teamId));
+  const tournamentIds = await publicTournamentIdsForTeam(teamId);
 
   revalidatePath("/admin");
   revalidatePath("/teams");
   revalidatePath("/teams/[slug]", "page");
+  await invalidatePublicTournamentCachesByIds(tournamentIds);
   return { success: true as const, slug: newSlug };
 }
 
@@ -331,6 +380,7 @@ export async function adminDeleteTeam(
     };
   }
 
+  const tournamentIds = await publicTournamentIdsForTeam(teamId);
   try {
     await db.delete(teams).where(eq(teams.id, teamId));
   } catch {
@@ -339,6 +389,7 @@ export async function adminDeleteTeam(
   revalidatePath("/admin");
   revalidatePath("/admin");
   revalidatePath("/teams");
+  await invalidatePublicTournamentCachesByIds(tournamentIds);
   return { success: true as const };
 }
 
@@ -382,6 +433,10 @@ export async function adminApproveSchool(schoolId: string) {
   revalidatePath("/admin");
   revalidatePath("/schools");
   revalidatePath(`/schools/${school.slug}`);
+  await invalidatePublicTournamentCachesByIds(
+    await publicTournamentIdsForSchool(schoolId),
+    { listing: true }
+  );
   return { success: true as const };
 }
 
@@ -408,6 +463,10 @@ export async function adminRejectSchool(schoolId: string) {
   revalidatePath("/admin");
   revalidatePath("/schools");
   revalidatePath(`/schools/${school.slug}`);
+  await invalidatePublicTournamentCachesByIds(
+    await publicTournamentIdsForSchool(schoolId),
+    { listing: true }
+  );
   return { success: true as const };
 }
 
@@ -433,6 +492,10 @@ export async function adminResetSchoolToPending(schoolId: string) {
   revalidatePath("/admin");
   revalidatePath("/schools");
   revalidatePath(`/schools/${school.slug}`);
+  await invalidatePublicTournamentCachesByIds(
+    await publicTournamentIdsForSchool(schoolId),
+    { listing: true }
+  );
   return { success: true as const };
 }
 
@@ -522,6 +585,7 @@ export async function adminResetStandaloneTeamToPending(teamId: string) {
 
 export async function adminDeleteSchool(schoolId: string) {
   await requireAdmin();
+  const tournamentIds = await publicTournamentIdsForSchool(schoolId);
   try {
     await db.delete(schools).where(eq(schools.id, schoolId));
   } catch {
@@ -530,5 +594,8 @@ export async function adminDeleteSchool(schoolId: string) {
   revalidatePath("/admin");
   revalidatePath("/admin");
   revalidatePath("/schools");
+  await invalidatePublicTournamentCachesByIds(tournamentIds, {
+    listing: true,
+  });
   return { success: true as const };
 }

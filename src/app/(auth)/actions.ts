@@ -25,8 +25,13 @@ import { users } from "@/lib/db/schema";
 import { signUpSchema, loginSchema, forgotPasswordSchema, resetPasswordSchema } from "@/lib/validators";
 import { checkContentFilter } from "@/lib/utils/content-filter";
 import { appBaseUrl } from "@/lib/email/resend";
+import {
+  loginRedirectPath,
+  pathWithSafeNext,
+} from "@/lib/security/safe-redirect";
 
 export async function login(formData: FormData) {
+  const requestedDestination = formData.get("next");
   const raw = {
     email: formData.get("email") as string,
     password: formData.get("password") as string,
@@ -53,10 +58,15 @@ export async function login(formData: FormData) {
     return { error: error.message };
   }
 
-  redirect("/dashboard?welcome=1");
+  redirect(
+    loginRedirectPath(
+      typeof requestedDestination === "string" ? requestedDestination : null
+    )
+  );
 }
 
 export async function requestPasswordReset(formData: FormData) {
+  const requestedDestination = formData.get("next");
   const raw = {
     email: formData.get("email") as string,
   };
@@ -67,7 +77,12 @@ export async function requestPasswordReset(formData: FormData) {
   }
 
   const supabase = await createClient();
-  const redirectTo = `${appBaseUrl()}/auth/callback?next=/reset-password`;
+  const resetPasswordPath = pathWithSafeNext(
+    "/reset-password",
+    typeof requestedDestination === "string" ? requestedDestination : null
+  );
+  const callbackPath = pathWithSafeNext("/auth/callback", resetPasswordPath);
+  const redirectTo = `${appBaseUrl()}${callbackPath}`;
 
   try {
     const { error } = await supabase.auth.resetPasswordForEmail(parsed.data.email, {
@@ -91,6 +106,7 @@ export async function requestPasswordReset(formData: FormData) {
 }
 
 export async function updatePassword(formData: FormData) {
+  const requestedDestination = formData.get("next");
   const raw = {
     password: formData.get("password") as string,
     confirmPassword: formData.get("confirmPassword") as string,
@@ -124,10 +140,16 @@ export async function updatePassword(formData: FormData) {
     };
   }
 
-  redirect("/login?reset=success");
+  redirect(
+    pathWithSafeNext(
+      "/login?reset=success",
+      typeof requestedDestination === "string" ? requestedDestination : null
+    )
+  );
 }
 
 export async function signup(formData: FormData) {
+  const requestedDestination = formData.get("next");
   const raw = {
     email: formData.get("email") as string,
     password: formData.get("password") as string,
@@ -189,7 +211,11 @@ export async function signup(formData: FormData) {
     }
   }
 
-  redirect("/dashboard?welcome=1");
+  redirect(
+    loginRedirectPath(
+      typeof requestedDestination === "string" ? requestedDestination : null
+    )
+  );
 }
 
 export async function logout() {

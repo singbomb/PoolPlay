@@ -55,6 +55,10 @@ import {
   type SchoolSearchItem,
 } from "@/lib/schools/search";
 import { assertTeamSchoolAttachmentAuthorized } from "@/lib/security/authorization-invariants";
+import {
+  invalidatePublicTournamentCachesByIds,
+  publicTournamentIdsForSchool,
+} from "@/lib/tournaments/public-cache-invalidation";
 
 const schoolSearchSchema = z.object({
   query: z.string().max(200).optional().default(""),
@@ -307,6 +311,12 @@ export async function updateSchool(
   if (slug !== school.slug) {
     revalidatePath(`/schools/${slug}`);
   }
+  if (renaming) {
+    await invalidatePublicTournamentCachesByIds(
+      await publicTournamentIdsForSchool(schoolId),
+      { listing: true }
+    );
+  }
   return { success: true as const, slug };
 }
 
@@ -320,6 +330,7 @@ export async function deleteSchool(schoolId: string) {
     return { error: "Only the school president can delete this school." };
   }
 
+  const tournamentIds = await publicTournamentIdsForSchool(schoolId);
   try {
     await db.delete(schools).where(eq(schools.id, schoolId));
   } catch {
@@ -328,6 +339,9 @@ export async function deleteSchool(schoolId: string) {
 
   revalidatePath("/schools");
   revalidatePath("/teams");
+  await invalidatePublicTournamentCachesByIds(tournamentIds, {
+    listing: true,
+  });
   return { success: true as const };
 }
 
@@ -613,6 +627,10 @@ export async function submitForVerification(schoolId: string) {
 
   revalidatePath(`/schools/${school.slug}`);
   revalidatePath("/admin");
+  await invalidatePublicTournamentCachesByIds(
+    await publicTournamentIdsForSchool(schoolId),
+    { listing: true }
+  );
   return { success: true as const, domainMatched };
 }
 

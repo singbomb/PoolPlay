@@ -54,6 +54,10 @@ const STATUS_LABEL: Record<string, string> = {
   completed: "Completed",
 };
 
+export function tournamentStatusLabel(status: string): string {
+  return STATUS_LABEL[status] ?? formatSnakeCaseLabel(status);
+}
+
 /**
  * Returns the label to show in a status badge. Archived overrides the
  * underlying status so users see one consistent label for old events.
@@ -64,5 +68,5 @@ export function statusBadgeLabel(
   today: string = todayISO()
 ): string {
   if (isTournamentArchived(tournamentDate, today)) return "Archived";
-  return STATUS_LABEL[status] ?? formatSnakeCaseLabel(status);
+  return tournamentStatusLabel(status);
 }

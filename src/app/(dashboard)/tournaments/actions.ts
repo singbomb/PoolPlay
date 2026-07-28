@@ -80,6 +80,10 @@ import {
   OperationValidationError,
 } from "@/lib/tournaments/competition-operation-rules";
 import { isCreatablePlayFormat } from "@/lib/labels/play-format";
+import {
+  invalidatePublicTournamentCaches,
+  invalidatePublicTournamentCachesByIds,
+} from "@/lib/tournaments/public-cache-invalidation";
 import type { TournamentStatus } from "@/types";
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -207,41 +211,64 @@ export async function renameTournament(tournamentId: string, name: string) {
   ]);
   if (contentError) return { error: contentError };
 
-  const [tournament] = await db
-    .select()
-    .from(tournaments)
-    .where(eq(tournaments.id, tournamentId))
-    .limit(1);
+  const result = await db.transaction(async (tx) => {
+    const executor = tx as unknown as typeof db;
+    const tournament = await loadLockedTournamentForOrganizer(
+      tournamentId,
+      user.id,
+      executor
+    );
+    if (!tournament) {
+      return {
+        ok: false as const,
+        error: "Only the organizer can rename this tournament",
+      };
+    }
 
-  if (!tournament || !await resolveIsTournamentOrganizer(tournament, user)) {
-    return { error: "Only the organizer can rename this tournament" };
+    if (trimmed === tournament.name.trim()) {
+      return {
+        ok: true as const,
+        changed: false as const,
+        oldSlug: tournament.slug,
+        newSlug: tournament.slug,
+      };
+    }
+
+    const base = slugify(trimmed, "tournament");
+    const otherSlugs = await executor
+      .select({ slug: tournaments.slug })
+      .from(tournaments)
+      .where(ne(tournaments.id, tournamentId));
+    const newSlug = uniqueSlug(
+      base,
+      otherSlugs.map((row) => row.slug)
+    );
+
+    await executor
+      .update(tournaments)
+      .set({
+        name: trimmed,
+        slug: newSlug,
+        updatedAt: new Date(),
+      })
+      .where(eq(tournaments.id, tournamentId));
+    return {
+      ok: true as const,
+      changed: true as const,
+      oldSlug: tournament.slug,
+      newSlug,
+    };
+  });
+  if (!result.ok) return { error: result.error };
+  if (!result.changed) {
+    return { success: true as const, slug: result.newSlug };
   }
-
-  if (trimmed === tournament.name.trim()) {
-    return { success: true as const, slug: tournament.slug };
-  }
-
-  const base = slugify(trimmed, "tournament");
-  const otherSlugs = await db
-    .select({ slug: tournaments.slug })
-    .from(tournaments)
-    .where(ne(tournaments.id, tournamentId));
-  const newSlug = uniqueSlug(
-    base,
-    otherSlugs.map((r) => r.slug)
-  );
-
-  await db
-    .update(tournaments)
-    .set({
-      name: trimmed,
-      slug: newSlug,
-      updatedAt: new Date(),
-    })
-    .where(eq(tournaments.id, tournamentId));
 
   revalidatePath("/tournaments");
   revalidatePath("/explore");
+  invalidatePublicTournamentCaches([result.oldSlug, result.newSlug], {
+    listing: true,
+  });
   revalidatePath("/dashboard");
   revalidatePath("/schedule");
   revalidatePath("/tournaments/[slug]", "page");
@@ -249,7 +276,7 @@ export async function renameTournament(tournamentId: string, name: string) {
   revalidatePath("/tournaments/[slug]/scoring", "page");
   revalidatePath("/tournaments/[slug]/register", "page");
 
-  return { success: true as const, slug: newSlug };
+  return { success: true as const, slug: result.newSlug };
 }
 
 export async function updateTournamentListingDetails(
@@ -307,6 +334,9 @@ export async function updateTournamentListingDetails(
 
   revalidatePath("/tournaments");
   revalidatePath("/explore");
+  await invalidatePublicTournamentCachesByIds([tournamentId], {
+    listing: true,
+  });
   revalidatePath(`/explore/tournaments/${tournament.slug}`);
   revalidatePath("/dashboard");
   revalidatePath("/tournaments/[slug]", "page");
@@ -416,6 +446,7 @@ export async function updateTournamentMatchFormat(
     })
     .where(eq(tournaments.id, tournamentId));
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/scoring", "page");
   revalidatePath("/schedule");
@@ -445,8 +476,9 @@ export async function deleteTournament(
     };
   }
 
+  let deletedSlug: string;
   try {
-    await db.transaction(async (tx) => {
+    deletedSlug = await db.transaction(async (tx) => {
       const [lockedTournament] = await tx
         .select()
         .from(tournaments)
@@ -542,6 +574,7 @@ export async function deleteTournament(
       }
 
       await tx.delete(tournaments).where(eq(tournaments.id, tournamentId));
+      return lockedTournament.slug;
     });
   } catch (error) {
     if (
@@ -555,6 +588,7 @@ export async function deleteTournament(
 
   revalidatePath("/tournaments");
   revalidatePath("/explore");
+  invalidatePublicTournamentCaches([deletedSlug], { listing: true });
   revalidatePath("/dashboard");
   revalidatePath("/schedule");
   revalidatePath("/tournaments/[slug]", "page");
@@ -592,6 +626,13 @@ export async function updateTournamentStatus(
       );
       if (!tournament) {
         return { error: "Only the organizer can update tournament status" };
+      }
+      if (tournament.status === status) {
+        return {
+          success: true as const,
+          changed: false as const,
+          slug: tournament.slug,
+        };
       }
 
       // Past-date tournaments are archived; status is read-only until the
@@ -646,9 +687,14 @@ export async function updateTournamentStatus(
         .update(tournaments)
         .set({ status, updatedAt: new Date() })
         .where(eq(tournaments.id, tournamentId));
-      return { success: true as const };
+      return {
+        success: true as const,
+        changed: true as const,
+        slug: tournament.slug,
+      };
     });
     if ("error" in result) return result;
+    if (!result.changed) return { success: true };
   } catch (error) {
     console.error("Could not update tournament status", error);
     return { error: "Could not update tournament status" };
@@ -656,6 +702,11 @@ export async function updateTournamentStatus(
 
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
+  revalidatePath("/explore");
+  revalidatePath("/explore/tournaments/[slug]", "page");
+  await invalidatePublicTournamentCachesByIds([tournamentId], {
+    listing: true,
+  });
   return { success: true };
 }
 
@@ -692,6 +743,9 @@ export async function updateTournamentDate(
 
   revalidatePath("/tournaments");
   revalidatePath("/explore");
+  await invalidatePublicTournamentCachesByIds([tournamentId], {
+    listing: true,
+  });
   revalidatePath("/dashboard");
   revalidatePath("/schedule");
   revalidatePath("/tournaments/[slug]", "page");
@@ -794,6 +848,7 @@ export async function removeDivision(tournamentId: string, divisionId: string) {
     return { error: competitionOperationError(error) };
   }
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   return { success: true };
 }
@@ -824,6 +879,9 @@ export async function releaseDivisionPools(
     });
     if ("error" in result) return { error: result.error };
 
+    if (!result.alreadyReleased) {
+      await invalidatePublicTournamentCachesByIds([tournamentId]);
+    }
     revalidatePath("/tournaments/[slug]", "page");
     revalidatePath("/tournaments/[slug]/scoring", "page");
     return {
@@ -921,6 +979,7 @@ export async function removeCourt(tournamentId: string, courtId: string) {
     authorizedParentId: tournamentId,
   });
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   return { success: true };
 }
@@ -974,8 +1033,9 @@ export async function updateRegistrationStatus(
     };
   }
 
+  let shouldInvalidate = false;
   try {
-    await transitionRegistrationStatuses({
+    const result = await transitionRegistrationStatuses({
       tournamentId: reg.tournamentId,
       registrationIds: [registrationId],
       toStatus: status,
@@ -983,10 +1043,14 @@ export async function updateRegistrationStatus(
       operationId,
       reason: "Organizer changed registration status",
     });
+    shouldInvalidate = !result.replayed;
   } catch (error) {
     return { error: competitionOperationError(error) };
   }
 
+  if (shouldInvalidate) {
+    await invalidatePublicTournamentCachesByIds([reg.tournamentId]);
+  }
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
   return { success: true };
@@ -1024,6 +1088,7 @@ export async function confirmPendingRegistrations(
   }
 
   let count: number;
+  let shouldInvalidate = false;
   try {
     const result = await transitionRegistrationStatuses({
       tournamentId,
@@ -1034,10 +1099,14 @@ export async function confirmPendingRegistrations(
       reason: "Organizer confirmed pending registrations",
     });
     count = result.count;
+    shouldInvalidate = !result.replayed;
   } catch (error) {
     return { error: competitionOperationError(error) };
   }
 
+  if (shouldInvalidate) {
+    await invalidatePublicTournamentCachesByIds([tournamentId]);
+  }
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
   return { success: true as const, count };
@@ -1108,6 +1177,7 @@ export async function updateDivision(
     })
     .where(eq(divisions.id, divisionId));
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
   return { success: true };
@@ -1216,6 +1286,7 @@ export async function setRegistrationDivision(
     return { error: competitionOperationError(error) };
   }
 
+  await invalidatePublicTournamentCachesByIds([reg.tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
   return { success: true };
@@ -1262,6 +1333,7 @@ export async function bulkAssignRegistrationsToDivision(
     return { error: competitionOperationError(error) };
   }
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
   return { success: true as const, count };
@@ -1306,6 +1378,7 @@ export async function bulkRemoveRegistrations(
     return { error: competitionOperationError(error) };
   }
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/register", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");

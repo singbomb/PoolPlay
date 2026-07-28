@@ -45,6 +45,7 @@ import {
   OperationConflictError,
   OperationValidationError,
 } from "@/lib/tournaments/competition-operation-rules";
+import { invalidatePublicTournamentCachesByIds } from "@/lib/tournaments/public-cache-invalidation";
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -135,6 +136,7 @@ export async function withdrawRegistration(
     return { error: "Could not withdraw this registration. Try again." };
   }
 
+  await invalidatePublicTournamentCachesByIds([tournamentId]);
   revalidatePath("/tournaments/[slug]", "page");
   revalidatePath("/tournaments/[slug]/register", "page");
   revalidatePath("/tournaments/[slug]/brackets", "page");
